@@ -1,6 +1,7 @@
-
+import sys
+import asyncio
 from collections import deque
-from threading import Lock
+from threading import Thread, Lock
 from typing import Dict, List, Optional
 
 import rclpy
@@ -40,16 +41,27 @@ class Manager(Node):
 
     def __init__(self, executor):
         super().__init__("prod_line_manage")
+
         self.recv_order = deque()
         self.proc_order: Dict[int, OrderRequest] = {} # order_id, OrderRequest
         self.mtrl_box_status: Dict[int, MaterialBoxStatus] = {} # order_id, MaterialBoxStatus
         self.qr_scan: List[CameraTrigger] = [] 
+
         self.mutex = Lock()
+
+        # Graph of conveyor structure
         self.conveyor = None
         self._initialize_conveyor()
+
+        self.loop = asyncio.new_event_loop()
+        self.loop_thread = Thread(target=self.run_loop, daemon=True)
+        self.loop_thread.start()
+        self.mutex = Lock()
+
         self.is_plc_connected = False
         self.is_releasing_mtrl_box = True
 
+        # maybe unused
         self.executor = executor
 
         # Callback groups
@@ -60,7 +72,7 @@ class Manager(Node):
 
         normal_timer_cbg = MutuallyExclusiveCallbackGroup()
         qr_handle_timer_cbg = MutuallyExclusiveCallbackGroup()
-        station_timer_cbg = MutuallyExclusiveCallbackGroup()
+        station_timer_cbgs = [MutuallyExclusiveCallbackGroup()] * self.NUM_DISPENSER_STATIONS
         self.get_logger().info("Callback groups are created")
 
         # Publishers
@@ -70,8 +82,8 @@ class Manager(Node):
         # Subscriptions
         self.plc_conn_sub = self.create_subscription(Bool, "plc_connection", self.plc_conn_cb, 10, callback_group=sub_cbg)
         self.rel_mtrl_box_sub = self.create_subscription(Bool, "releasing_material_box", self.releasing_mtrl_box_cb, 10, callback_group=sub_cbg)
-        self.sliding_platform_sub = self.create_subscription(UInt8MultiArray, "sliding_platform", self.sliding_platform_cb, 10, callback_group=sub_cbg)
-        self.sliding_platform_movement_sub = self.create_subscription(UInt8MultiArray, "sliding_platform_movement", self.sliding_platform_movement_cb, 10, callback_group=sub_cbg)
+        self.sliding_platform_curr_sub = self.create_subscription(UInt8MultiArray, "sliding_platform", self.sliding_platform_curr_cb, 10, callback_group=sub_cbg)
+        self.sliding_platform_cmd_sub = self.create_subscription(UInt8MultiArray, "sliding_platform_cmd", self.sliding_platform_cmd_cb, 10, callback_group=sub_cbg)
         self.sliding_platform_ready_sub = self.create_subscription(UInt8MultiArray, "sliding_platform_ready", self.sliding_platform_ready_cb, 10, callback_group=sub_cbg)
         self.qr_scan_sub = self.create_subscription(CameraTrigger, "qr_camera_scan", self.qr_scan_cb, 10, callback_group=sub_cbg)
         self.get_logger().info("Subscriptions are created")
@@ -89,16 +101,16 @@ class Manager(Node):
         self.get_logger().info("Service Clients are created")
 
         # Timers
-        # self.qr_handle_timer = self.create_timer(0.5, self.qr_handle_cb, callback_group=qr_handle_timer_cbg)
+        self.qr_handle_timer = self.create_timer(0.5, self.qr_handle_cb, callback_group=qr_handle_timer_cbg)
         self.start_order_timer = self.create_timer(1.0, self.start_order_cb, callback_group=normal_timer_cbg)
         self.order_status_timer = self.create_timer(1.0, self.order_status_cb, callback_group=normal_timer_cbg)
         self.dis_station_timers: Dict[int, rclpy.Timer.Timer] = {}
-        self._initialize_dis_station_timers(station_timer_cbg)
+        self._initialize_dis_station_timers(station_timer_cbgs)
         self.get_logger().info("Timers are created")
         
         self.get_logger().info("Produation Line Manager Node started")
 
-    # Subscriptions callback
+    # Subscription callbacks
     def plc_conn_cb(self, msg: Bool) -> None:
         with self.mutex:
             self.is_plc_connected = msg.data
@@ -108,9 +120,12 @@ class Manager(Node):
     def releasing_mtrl_box_cb(self, msg: Bool) -> None:
         with self.mutex:
             self.is_releasing_mtrl_box = msg.data
+            if self.is_releasing_mtrl_box:
+                conveyor = self.conveyor.get_conveyor(1)
+                conveyor.is_occupied = True
         self.get_logger().debug(f"Received releasing material box message: {msg}")
 
-    def sliding_platform_cb(self, msg: UInt8MultiArray) -> None:
+    def sliding_platform_curr_cb(self, msg: UInt8MultiArray) -> None:
         if len(msg.data) != self.NUM_DISPENSER_STATIONS:
             self.get_logger().warning(f"Message length {len(msg.data)} doesn't match stations {len(self.dis_station)}")
             return
@@ -129,7 +144,7 @@ class Manager(Node):
         except Exception as e:
             self.get_logger().error(f"Error processing sliding platform message: {e}")
     
-    def sliding_platform_movement_cb(self):
+    def sliding_platform_cmd_cb(self, msg: UInt8MultiArray) -> None:
         if len(msg.data) != self.NUM_DISPENSER_STATIONS:
             self.get_logger().warning(f"Message length {len(msg.data)} doesn't match stations {len(self.dis_station)}")
             return
@@ -217,13 +232,13 @@ class Manager(Node):
                     self.mtrl_box_status_pub.publish(status)
                 else:
                     self.get_logger().warning(f"Invalid status type found: {type(status).__name__}")
-        address = 5030
-        count = 1
-        success = await self.read_registers(address, count)
-        if success:
-            self.get_logger().info(f"OK to read {address}")
-        else:
-            self.get_logger().warning(f"Failed to read to register {address}")
+        # address = 5030
+        # count = 1
+        # success = await self.read_registers(address, count)
+        # if success:
+        #     self.get_logger().info(f"OK to read {address}")
+        # else:
+        #     self.get_logger().warning(f"Failed to read to register {address}")
 
     async def qr_handle_cb(self) -> None:
         to_remove = []
@@ -305,6 +320,7 @@ class Manager(Node):
         self.get_logger().debug(f"Completed to handle the QR scan")
 
     async def station_decision_cb(self, station_id: int) -> None:
+        self.get_logger().debug(f"Dispenser Station [{station_id}] callback is called")
         with self.mutex:
             station = self.conveyor.get_station(id)
             if station is None:
@@ -338,10 +354,24 @@ class Manager(Node):
             
         if target_cell == 29:
             self.get_logger().info(f"Station {station_id} has all cells completed")
+            with self.mutex:
+                conveyor = self.conveyor.get_conveyor_by_station(station_id)
+                if conveyor.is_occupied:
+                    self.get_logger().info("The conveyor is occupied. Try to move out in the next callback")
+                else:
+                    address = 5000 + station_id
+                    values = [29]
+                    success = await self.write_registers(address, values)
+                    if success:
+                        conveyor.is_occupied = True
+                        self.get_logger().info(f"The material box [{mtrl_box_id}] is moving out in station [{station_id}]")
+                    else:
+                        conveyor.is_occupied = False
+                        self.get_logger().info(f"Failed to move out material box [{mtrl_box_id}] in station [{station_id}]")
         elif target_cell == curr_sliding_platform:
             # TODO: find requested
             req = DispenseDrug.Request()
-            req.content.append(???)
+            # req.content.append(???)
 
             while not self.dis_station_clis[station_id].wait_for_service(timeout_sec=1.0):
                 if not rclpy.ok():
@@ -364,7 +394,7 @@ class Manager(Node):
             if cmd_sliding_platform != curr_sliding_platform:
                 address = 5000 + id
                 success = await self.write_registers(address, [target_cell])
-                with self.mutex
+                with self.mutex:
                     station.cmd_sliding_platform = target_cell
 
     # Service Server callback
@@ -449,7 +479,7 @@ class Manager(Node):
 
     def is_bound(self, material_box_id: int) -> bool:
         if not isinstance(material_box_id, int):
-            raise TypeError(f"Expected integer id, got {type(material_box_id).__name__}")
+            raise TypeError(f"Unexpected id >>> {type(material_box_id).__name__}")
         
         with self.mutex:
             for status in self.mtrl_box_status.values():
@@ -509,16 +539,21 @@ class Manager(Node):
             self.dis_station_clis[i] = self.create_client(
                 DispenseDrug, 
                 f"/dispenser_station_{i}/dispense_request",
-                callback_group=cbgs[i - 1])
+                callback_group=cbgs[i - 1]
+            )
     
-    def _initialize_dis_station_timers(self, cbg) -> None:
+    def _initialize_dis_station_timers(self, cbgs: List[MutuallyExclusiveCallbackGroup]) -> None:
         """Initialize dispenser stations timers."""
         for i in range(1, self.NUM_DISPENSER_STATIONS + 1):
             self.dis_station_timers[i] = self.create_timer(
-                0.25,
-                lambda: self.station_decision_cb(i), 
-                callback_group=cbg
+                0.5,
+                lambda station_id=i: asyncio.run_coroutine_threadsafe(
+                    self.station_decision_cb(station_id),
+                    self.loop
+                ).result(),
+                callback_group=cbgs[i - 1]
             )
+            self.get_logger().debug(f"Dispenser station [{i}] timer is created")
 
     def _initialize_conveyor(self) -> None:
         """Initialize Conveyor Structure."""
@@ -608,19 +643,42 @@ class Manager(Node):
         except Exception as e:
             self.get_logger().error(f"Error writing registers: {e}")
             return False
+    
+    def run_loop(self):
+        """Run the asyncio event loop in a dedicated thread."""
+        asyncio.set_event_loop(self.loop)
+        self.get_logger().info("Started the event loop.")
+        self.loop.run_forever()
+
+    def destroy_node(self):
+        if self.loop.is_running():
+            self.loop.call_soon_threadsafe(self.loop.stop)
+            self.get_logger().info("Removed loop successfully")
+
+        if self.loop_thread is not None:
+            self.loop_thread.join()
+            self.get_logger().info("Removed loop thread successfully")
+
+        super().destroy_node()
+
 
 def main(args=None):
+    rclpy.init(args=args)
     try:
-        rclpy.init(args=args)
         executor = MultiThreadedExecutor()
-        node = Manager(executor)
-        executor.add_node(node)
-        executor.spin()
-    except (KeyboardInterrupt, ExternalShutdownException):
+        manager = Manager(executor)
+        executor.add_node(manager)
+        try:
+            executor.spin()
+        finally:
+            executor.shutdown()
+            manager.destroy_node()
+    except KeyboardInterrupt:
         pass
+    except ExternalShutdownException:
+        sys.exit(1)
     finally:
-        if rclpy.ok():
-            rclpy.shutdown()
+        rclpy.try_shutdown()
 
 if __name__ == "__main__":
     main()

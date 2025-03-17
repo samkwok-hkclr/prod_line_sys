@@ -76,6 +76,21 @@ class Conveyor:
     
         return None
     
+    def get_conveyor_by_station(self, id: int) -> Optional[ConveyorSegment]:
+        """Return the ConveyorSegment that the station attached to"""
+        if not self.head:
+            return None
+        
+        curr_node = self.head
+        while curr_node:
+            if curr_node.l_station and curr_node.l_station.id == id:
+                return curr_node
+            if curr_node.r_station and curr_node.r_station.id == id:
+                return curr_node
+            curr_node = curr_node.next
+        
+        return None
+    
     def get_next_conveyor(self, id: int) -> Optional[ConveyorSegment]:
         """Return the ConveyorSegment that comes after the segment with the specified id,
         or None if not found or if it's the last segment"""
@@ -146,14 +161,22 @@ class Conveyor:
         chain = []
         index = 1
         while curr_node:
-            segment_info = f"[{index}, id:{curr_node.id}"
+            segment_info = str()
             if curr_node.l_station:
-                segment_info += f", L:{curr_node.l_station}"
+                segment_info += f"[{curr_node.l_station}]>>>\t"
+            else:
+                segment_info += "\t\t\t\t\t\t"
+            core =  f"<<< id:{curr_node.id}, box:{curr_node.curr_mtrl_box}, occupied:{curr_node.is_occupied}>>>"
+            segment_info += core
+            
             if curr_node.r_station:
-                segment_info += f", R:{curr_node.r_station}"
-            segment_info += "]"
+                segment_info += f"\t<<<[{curr_node.r_station}]"
+            
+            segment_info += "\n\t\t\t\t\t\t" + "^" * len(core)
             chain.append(segment_info)
             index += 1
             curr_node = curr_node.next
-        return " --> \n".join(chain)
+
+        chain.reverse()
+        return " \n".join(chain)
     

@@ -10,3 +10,5 @@ class ConveyorSegment:
         self.right_station = None
         self.next = None
     
+    def __str__(self):
+        return f"Conveyor id:{self.id}, box:{self.curr_mtrl_box}, occupied:{self.is_occupied}"
