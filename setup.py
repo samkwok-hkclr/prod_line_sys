@@ -19,7 +19,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'manager = prod_line_sys.manager:main'
+            'manager = prod_line_sys.manager:main',
+            'fake_new_order_node = prod_line_sys.fake_new_order:main'
         ],
     },
 )

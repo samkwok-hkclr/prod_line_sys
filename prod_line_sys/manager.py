@@ -3,7 +3,7 @@ import asyncio
 from collections import deque
 from threading import Thread, Lock
 from typing import Dict, List, Optional
-
+from queue import Queue
 import rclpy
 
 from rclpy.node import Node
@@ -20,7 +20,7 @@ from smdps_msgs.msg import (CameraState,
                             ProductionLineStatus, 
                             OrderRequest,
                             MaterialBox)
-from smdps_msgs.srv import NewOrder, ReadRegister, WriteRegister, MoveSlidingPlatform, DispenseDrug
+from smdps_msgs.srv import NewOrder, ReadRegister, WriteRegister, MoveSlidingPlatform, DispenseDrug, UInt8
 
 from .dispenser_station import DispenserStation
 from .conveyor_segment import ConveyorSegment
@@ -42,10 +42,12 @@ class Manager(Node):
     def __init__(self, executor):
         super().__init__("prod_line_manage")
 
+        # Local memory storage
         self.recv_order = deque()
         self.proc_order: Dict[int, OrderRequest] = {} # order_id, OrderRequest
         self.mtrl_box_status: Dict[int, MaterialBoxStatus] = {} # order_id, MaterialBoxStatus
         self.qr_scan: List[CameraTrigger] = [] 
+        self.elevator_queue = Queue()
 
         self.mutex = Lock()
 
@@ -53,14 +55,16 @@ class Manager(Node):
         self.conveyor = None
         self._initialize_conveyor()
 
+        # handle async functions
         self.loop = asyncio.new_event_loop()
         self.loop_thread = Thread(target=self.run_loop, daemon=True)
         self.loop_thread.start()
         self.mutex = Lock()
 
+        # State of PLC registers
         self.is_plc_connected = False
-        self.is_releasing_mtrl_box = True
-
+        self.is_releasing_mtrl_box = False
+        self.is_elevator_ready = False
         # maybe unused
         self.executor = executor
 
@@ -68,11 +72,11 @@ class Manager(Node):
         sub_cbg = MutuallyExclusiveCallbackGroup()
         srv_ser_cbg = MutuallyExclusiveCallbackGroup()
         srv_cli_cbg = MutuallyExclusiveCallbackGroup()
-        station_srv_cli_cbgs = [MutuallyExclusiveCallbackGroup()] * self.NUM_DISPENSER_STATIONS
+        station_srv_cli_cbgs = [MutuallyExclusiveCallbackGroup() for _ in range(self.NUM_DISPENSER_STATIONS)]
 
         normal_timer_cbg = MutuallyExclusiveCallbackGroup()
         qr_handle_timer_cbg = MutuallyExclusiveCallbackGroup()
-        station_timer_cbgs = [MutuallyExclusiveCallbackGroup()] * self.NUM_DISPENSER_STATIONS
+        station_timer_cbgs = [MutuallyExclusiveCallbackGroup() for _ in range(self.NUM_DISPENSER_STATIONS)]
         self.get_logger().info("Callback groups are created")
 
         # Publishers
@@ -85,6 +89,7 @@ class Manager(Node):
         self.sliding_platform_curr_sub = self.create_subscription(UInt8MultiArray, "sliding_platform", self.sliding_platform_curr_cb, 10, callback_group=sub_cbg)
         self.sliding_platform_cmd_sub = self.create_subscription(UInt8MultiArray, "sliding_platform_cmd", self.sliding_platform_cmd_cb, 10, callback_group=sub_cbg)
         self.sliding_platform_ready_sub = self.create_subscription(UInt8MultiArray, "sliding_platform_ready", self.sliding_platform_ready_cb, 10, callback_group=sub_cbg)
+        self.elevator_sub = self.create_subscription(Bool, "elevator", self.elevator_cb, 10, callback_group=sub_cbg)
         self.qr_scan_sub = self.create_subscription(CameraTrigger, "qr_camera_scan", self.qr_scan_cb, 10, callback_group=sub_cbg)
         self.get_logger().info("Subscriptions are created")
         
@@ -96,6 +101,8 @@ class Manager(Node):
         # Service Clients
         self.read_cli = self.create_client(ReadRegister, "read_register", callback_group=srv_cli_cbg)
         self.write_cli = self.create_client(WriteRegister, "write_register", callback_group=srv_cli_cbg)
+        self.income_mtrl_box_cli = self.create_client(UInt8, "income_material_box", callback_group=srv_cli_cbg)
+        self.rel_blocking_cli = self.create_client(Trigger, "release_blocking", callback_group=srv_cli_cbg)
         self.dis_station_clis: Dict[int, rclpy.client.Client] = {} # station_id, Client
         self._initialize_dis_station_clis(station_srv_cli_cbgs)
         self.get_logger().info("Service Clients are created")
@@ -104,8 +111,12 @@ class Manager(Node):
         self.qr_handle_timer = self.create_timer(0.5, self.qr_handle_cb, callback_group=qr_handle_timer_cbg)
         self.start_order_timer = self.create_timer(1.0, self.start_order_cb, callback_group=normal_timer_cbg)
         self.order_status_timer = self.create_timer(1.0, self.order_status_cb, callback_group=normal_timer_cbg)
+        self.elevator_timer = self.create_timer(
+            1.0, 
+            lambda: asyncio.run_coroutine_threadsafe(self.elevator_dequeue_cb(), self.loop).result(),
+            callback_group=normal_timer_cbg)
         self.dis_station_timers: Dict[int, rclpy.Timer.Timer] = {}
-        self._initialize_dis_station_timers(station_timer_cbgs)
+        self._initialize_dis_station_timers(1.0, station_timer_cbgs)
         self.get_logger().info("Timers are created")
         
         self.get_logger().info("Produation Line Manager Node started")
@@ -119,11 +130,11 @@ class Manager(Node):
 
     def releasing_mtrl_box_cb(self, msg: Bool) -> None:
         with self.mutex:
-            self.is_releasing_mtrl_box = msg.data
+            self.is_releasing_mtrl_box = bool(msg.data)
             if self.is_releasing_mtrl_box:
                 conveyor = self.conveyor.get_conveyor(1)
                 conveyor.is_occupied = True
-        self.get_logger().debug(f"Received releasing material box message: {msg}")
+        self.get_logger().debug(f"Received releasing material box state: {self.is_releasing_mtrl_box}")
 
     def sliding_platform_curr_cb(self, msg: UInt8MultiArray) -> None:
         if len(msg.data) != self.NUM_DISPENSER_STATIONS:
@@ -176,6 +187,8 @@ class Manager(Node):
                         self.get_logger().warning(f"No station found for ID {i} <<<< 2")
                         continue
                     station.is_platform_ready = platform_ready_state
+                    if station.is_platform_ready != 0:
+                        self.get_logger().debug(f"Station [{i}] platform is ready!")
             
             self.get_logger().debug(f"Received sliding platform ready message: {msg}")
         except AttributeError as e:
@@ -184,6 +197,17 @@ class Manager(Node):
             self.get_logger().error(f"Error processing sliding platform ready message: {e}")
         return
     
+    def elevator_cb(self, msg: Bool):
+        with self.mutex:
+            # Store the previous state
+            prev_elevator_ready = self.is_elevator_ready
+            # Update the state
+            self.is_elevator_ready = msg.data
+            if msg and msg.data == True and prev_elevator_ready == False:
+                self.elevator_queue.put(self.get_clock().now())
+                self.get_logger().warning(f"A state change of elevator 0 -> 1")
+
+
     def qr_scan_cb(self, msg: CameraTrigger) -> None:
         if not 1 <= msg.camera_id <= 11:
             self.get_logger().error(f"Received undefined camera_id: {msg.camera_id}")
@@ -193,14 +217,18 @@ class Manager(Node):
             return
         
         with self.mutex:
-            if self.qr_scan.empty():
+            if len(self.qr_scan) == 0:
                 self.qr_scan.append(msg)
             else:
-                last_scan = self.qr_scan[-1]
-                if last_scan.camera_id == msg.camera_id and last_scan.material_box_id == msg.material_box_id:
-                    self.get_logger().info(f"Camera {msg.camera_id} repeated the scan")
-                else:
+                found = False
+                for scan in self.qr_scan:
+                    if scan.camera_id == msg.camera_id and scan.material_box_id == msg.material_box_id:
+                        found = True
+                        self.get_logger().info(f"Camera {msg.camera_id} repeated the scan with box [{msg.material_box_id}]")
+                        break
+                if not found:
                     self.qr_scan.append(msg)
+                    self.get_logger().info(f"Camera {msg.camera_id} box [{msg.material_box_id}] is append to qr_scan")
         self.get_logger().info(f"Received CameraTrigger message: camera_id={msg.camera_id}, material_box_id={msg.material_box_id}")
 
     # Timers callback
@@ -218,8 +246,8 @@ class Manager(Node):
 
                 status = self.mtrl_box_status[order.order_id]
                 status.start_time = self.get_clock().now().to_msg()
-            self.get_logger().info("Added a order to processing queue")
-            self.get_logger().info("Removed a order from received queue")
+            self.get_logger().info(">>> Added a order to processing queue")
+            self.get_logger().info(">>> Removed a order from received queue")
         else:
             self.get_logger().error("Failed to call the PLC to release a material box")
     
@@ -232,142 +260,198 @@ class Manager(Node):
                     self.mtrl_box_status_pub.publish(status)
                 else:
                     self.get_logger().warning(f"Invalid status type found: {type(status).__name__}")
-        # address = 5030
-        # count = 1
-        # success = await self.read_registers(address, count)
-        # if success:
-        #     self.get_logger().info(f"OK to read {address}")
-        # else:
-        #     self.get_logger().warning(f"Failed to read to register {address}")
+
+    async def elevator_dequeue_cb(self) -> None:
+        if self.is_releasing_mtrl_box or self.elevator_queue.empty():
+            return
+        req = Trigger.Request()
+
+        while not self.rel_blocking_cli.wait_for_service(timeout_sec=1.0):
+            if not rclpy.ok():
+                return None
+            self.get_logger().info("rel_blocking Service not available, waiting again...")
+
+        try:
+            future = self.rel_blocking_cli.call_async(req)
+            await future
+            res = future.result()
+            if res.success:
+                self.get_logger().info(f"release blocking successfully")
+                self.elevator_queue.get()
+                return True
+            else:
+                self.get_logger().error("Failed to send rel_blocking")
+                return False
+        except Exception as e:
+            self.get_logger().error(f"Error writing registers: {e}")
+            return False
 
     async def qr_handle_cb(self) -> None:
         to_remove = []
-        with self.mutex:
-            self.get_logger().debug(f"Started to handle the QR scan, Total: {len(self.qr_scan)}")
-            for msg in self.qr_scan[:]:
-                is_completed = False
-                camera_id = msg.camera_id
-                material_box_id = msg.material_box_id
-                
-                order_id = self.get_order_id_by_mtrl_box(material_box_id)
-                if order_id == 0:
-                    self.get_logger().info(f"The material box [{material_box_id}] does not bound to order")
-                
-                match camera_id:
-                    case 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8:
-                        decide_station_ids, register_addr = self.CANMERA_STATION_PLC_MAP[camera_id]
+        total = len(self.qr_scan)
+        if total == 0:
+            return
+        else:
+            self.get_logger().info(f"Started to handle the QR scan, Total: {total}")
 
-                        if camera_id == 1 and not self.is_bound(material_box_id):
-                            success = self.bind_mtrl_box(material_box_id)
-                            if not success:
-                                self.get_logger().warning(f"Failed to bind material box {material_box_id}")
-                                continue
+        for msg in self.qr_scan[:]:
+            is_completed = False
+            camera_id = msg.camera_id
+            material_box_id = msg.material_box_id
+            self.get_logger().info(f"camera id: {camera_id}, material box id: {material_box_id}")
+            order_id = self.get_order_id_by_mtrl_box(material_box_id)
+            if order_id == 0:
+                self.get_logger().info(f"The material box [{material_box_id}] does not bound to any order!")
 
-                        decide_station_ids = self.remove_occupied_station(decide_station_ids)
-                        decision = self.make_decision_v1(order_id, decide_station_ids)
-                        
-                        if decision in decide_station_ids:
-                            values = [2] if decision == decide_station_ids[0] else [3]
-                            success = await self.write_registers(register_addr, values)
-                            if success:
-                                if station := self.conveyor.get_station(decision):
+            match camera_id:
+                case 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8:
+                    decide_station_ids, register_addr = self.CANMERA_STATION_PLC_MAP[camera_id]
+
+                    if camera_id == 1 and not self.is_bound(material_box_id):
+                        self.get_logger().error(f"The material box [{material_box_id}] does not bound")
+                        success = self.bind_mtrl_box(material_box_id)
+                        if success:
+                            self.get_logger().error(f"The material box [{material_box_id}] bound to order id [{order_id}]")
+                        else:
+                            self.get_logger().warning(f"Failed to bind material box {material_box_id}")
+                            continue
+
+                    # decide_station_ids = self.remove_occupied_station(decide_station_ids)
+                    decision = self.movement_decision_v1(order_id, decide_station_ids)
+                    
+                    if decision in decide_station_ids:
+                        values = [2] if decision == decide_station_ids[0] else [3]
+                        success = await self.write_registers(register_addr, values)
+                        if success:
+                            if station := self.conveyor.get_station(decision):
+                                with self.mutex:
                                     station.is_occupied = True
                                     station.curr_mtrl_box = material_box_id
                                     is_completed = True
-                            else:
-                                self.get_logger().error(f"Failed to write to register {register_addr}")
                         else:
-                            next_conveyor = self.conveyor.get_next_conveyor(camera_id)
-                            if next_conveyor and not next_conveyor.is_occupied:
-                                values = [1]
-                                success = await self.write_registers(register_addr, values)
-                                if success:
-                                    if conveyor := self.conveyor.get_conveyor(camera_id):
+                            self.get_logger().error(f"Failed to write to register {register_addr}")
+                    else:
+                        next_conveyor = self.conveyor.get_next_conveyor(camera_id)
+                        if next_conveyor and not next_conveyor.is_occupied:
+                            values = [1]
+                            success = await self.write_registers(register_addr, values)
+                            if success:
+                                if conveyor := self.conveyor.get_conveyor(camera_id):
+                                    with self.mutex:
                                         conveyor.is_occupied = True
                                         conveyor.curr_mtrl_box = material_box_id
                                         if camera_id != 1:
                                             conveyor.is_occupied = False
                                             conveyor.curr_mtrl_box = 0
-                                        is_completed = True
-                                else:
-                                    self.get_logger().error(f"Failed to write to register {register_addr}")
+                                    is_completed = True
                             else:
-                                self.get_logger().warning(f"No available next conveyor for camera_id {camera_id}")
-                        self.get_logger().info(f"decision [{decision}] is made for material box [{material_box_id}] in camera [{camera_id}]")
-                    case 9:
-                        # vision inspection
+                                self.get_logger().error(f"Failed to write to register {register_addr}")
+                        else:
+                            self.get_logger().warning(f"The next conveyor is unavailable for camera [{camera_id}]")
+                    
+                    self.get_logger().warning(f"decision [{decision}] / {decide_station_ids} is made for material box [{material_box_id}] in camera [{camera_id}]")
+                case 9:
+                    # vision inspection
+                    is_completed = True
+                    self.get_logger().info(f"Vision inspection triggered for material box [{material_box_id}]")
+                    pass
+                case 10:
+                    # packaging machine 1
+                    # if order is completed
+                    # send pkg req
+                    # else do the following
+                    success = await self.send_income_mtrl_box(material_box_id)
+                    if success:
                         is_completed = True
-                        self.get_logger().info(f"Vision inspection triggered for material box [{material_box_id}]")
+                    else:
                         pass
-                    case 10:
-                        # packaging machine 1
-                        is_completed = True
-                        self.get_logger().info(f"Packaging machine 1 triggered for material box [{material_box_id}]")
-                        pass            
-                    case 11:
-                        # packaging machine 2
-                        is_completed = True
-                        self.get_logger().info(f"Packaging machine 2 triggered for material box [{material_box_id}]")
-                        pass
-                    case _:
-                        self.get_logger().info(f"Received unknown camera ID: {camera_id}")
-                if is_completed:
-                    to_remove.append(msg)
+                    self.get_logger().info(f"Packaging machine 1 triggered for material box [{material_box_id}]")            
+                case 11:
+                    # packaging machine 2
+                    if not self.is_releasing_mtrl_box:
+                        self.get_logger().error(f"A material box is passing the packaging machine 2")
+                        address = 5200
+                        values = [1]
+                        success = await self.write_registers(address, values)
+                        if success:
+                            with self.mutex:
+                                is_completed = True
+                            self.get_logger().error(f"retrieve material box successfully")
+                        else:
+                            self.get_logger().error(f"Failed to write to register {address}")
+                    self.get_logger().info(f"Packaging machine 2 triggered for material box [{material_box_id}]")
+                    pass
+                case _:
+                    self.get_logger().info(f"Received unknown camera ID: {camera_id}")
+            # end of match case        
+            if is_completed:
+                to_remove.append(msg)
 
+        # end of for loop self.qr_scan
+        with self.mutex:
             for msg in to_remove:
                 self.qr_scan.remove(msg)
+                self.get_logger().info(f"Removed message camera id: {msg.camera_id}, box: {msg.material_box_id} ")
 
         self.get_logger().debug(f"Completed to handle the QR scan")
 
     async def station_decision_cb(self, station_id: int) -> None:
         self.get_logger().debug(f"Dispenser Station [{station_id}] callback is called")
-        with self.mutex:
-            station = self.conveyor.get_station(id)
-            if station is None:
-                self.get_logger().debug(f"No station found with ID: {id}")
-                return
-            if not station.is_occupied:
-                self.get_logger().debug(f"Station {id} is not occupied")
-                return
-            if station.curr_mtrl_box == 0:
-                self.get_logger().debug(f"Station {id} has no material box")
-                return
-            if not station.is_platform_ready:
-                self.get_logger().debug(f"Station {id} sliding platform is not ready")
-                return
         
-            mtrl_box_id = station.curr_mtrl_box
-            order_id = self.get_order_id_by_mtrl_box(mtrl_box_id)
-            order = self.proc_order[order_id]
-            status = self.mtrl_box_status[order_id]
-            curr_sliding_platform = station.curr_sliding_platform
-            cmd_sliding_platform = station.cmd_sliding_platform
+        station = self.conveyor.get_station(station_id)
+        if station is None:
+            self.get_logger().warning(f"No station found with ID: {station_id}")
+            return
+        if not station.is_occupied:
+            self.get_logger().debug(f"Station {station_id} is not occupied")
+            return
+        if station.curr_mtrl_box == 0:
+            self.get_logger().warning(f"Station {station_id} has no material box")
+            return
+        if not station.is_platform_ready:
+            self.get_logger().warning(f"Station {station_id} sliding platform is not ready")
+            return
 
-            try:
-                target_cell = station.is_completed.index(False)
-            except ValueError:
-                target_cell = 29
+        self.get_logger().warning(f"Started to make decision for Station {station_id}")
 
-            if target_cell != 29:
-                cell_curr_mtrl_box = status.material_box.slots[target_cell]
-                cell_order_mtrl_box = order.request.material_box.slots[target_cell]
+        mtrl_box_id = station.curr_mtrl_box
+        order_id = self.get_order_id_by_mtrl_box(mtrl_box_id)
+        order = self.proc_order[order_id]
+        status = self.mtrl_box_status[order_id]
+        curr_sliding_platform = station.curr_sliding_platform
+        cmd_sliding_platform = station.cmd_sliding_platform
+
+        try:
+            # target_cell = station.is_completed.index(False)
+            target_cell = 29
+        except ValueError:
+            target_cell = 29
+
+        if target_cell != 29:
+            cell_curr_mtrl_box = status.material_box.slots[target_cell]
+            cell_order_mtrl_box = order.request.material_box.slots[target_cell]
+
+        self.get_logger().warning(f"Debug: force to move out Station [{station_id}]")
             
         if target_cell == 29:
             self.get_logger().info(f"Station {station_id} has all cells completed")
-            with self.mutex:
-                conveyor = self.conveyor.get_conveyor_by_station(station_id)
-                if conveyor.is_occupied:
-                    self.get_logger().info("The conveyor is occupied. Try to move out in the next callback")
-                else:
-                    address = 5000 + station_id
-                    values = [29]
-                    success = await self.write_registers(address, values)
-                    if success:
+            
+            conveyor = self.conveyor.get_conveyor_by_station(station_id)
+            if conveyor.is_occupied:
+                self.get_logger().info("The conveyor is occupied. Try to move out in the next callback")
+            else:
+                address = 5000 + station_id
+                values = [29]
+                success = await self.write_registers(address, values)
+                if success:
+                    with self.mutex:
                         conveyor.is_occupied = True
-                        self.get_logger().info(f"The material box [{mtrl_box_id}] is moving out in station [{station_id}]")
-                    else:
-                        conveyor.is_occupied = False
-                        self.get_logger().info(f"Failed to move out material box [{mtrl_box_id}] in station [{station_id}]")
+                        station.is_occupied = False
+                        station.curr_mtrl_box = 0
+                        station.is_completed = [False] * 28
+                    self.get_logger().info(f"The material box [{mtrl_box_id}] is moving out in station [{station_id}]")
+                else:
+                    self.get_logger().info(f"Failed to move out material box [{mtrl_box_id}] in station [{station_id}]")
         elif target_cell == curr_sliding_platform:
             # TODO: find requested
             req = DispenseDrug.Request()
@@ -392,24 +476,24 @@ class Manager(Node):
                 self.get_logger().error(f"Error reading registers: {e}")
         else:
             if cmd_sliding_platform != curr_sliding_platform:
-                address = 5000 + id
+                address = 5000 + station_id
                 success = await self.write_registers(address, [target_cell])
                 with self.mutex:
                     station.cmd_sliding_platform = target_cell
 
     # Service Server callback
     def new_order_cb(self, req, res):
-        self.get_logger().info(f"Received NewOrder request: order_id={req.order_id}")
+        self.get_logger().info(f"Received NewOrder request: order_id={req.request.order_id}")
         self.recv_order.append(req.request)
         msg = MaterialBoxStatus()
         msg.creation_time = self.get_clock().now().to_msg()
         msg.id = 0
         msg.status = MaterialBoxStatus.STATUS_INITIALIZING
-        msg.priority = req.requset.priority
-        msg.order_id = req.requset.order_id
+        msg.priority = req.request.priority
+        msg.order_id = req.request.order_id
         with self.mutex:
-            self.mtrl_box_status[req.requset.order_id] = msg
-        res.success = True
+            self.mtrl_box_status[req.request.order_id] = msg
+        res.response.success = True
         return res
     
     async def move_sliding_platform_cb(self, req, res):
@@ -425,7 +509,7 @@ class Manager(Node):
             res.message = f"Failed to write to register {address} with cell_no {req.cell_no}"
         return res
     
-    def make_decision_v1(self, order_id: int, dis_station_id: List[int]) -> int:
+    def movement_decision_v1(self, order_id: int, dis_station_id: List[int]) -> int:
         try:
             with self.mutex:
                 status = self.mtrl_box_status.get(order_id)
@@ -442,9 +526,9 @@ class Manager(Node):
                 req_to_go = self.get_req_to_go(req_mtrl_box)
             
             # Log current state
-            self.get_logger().info(
-                f"Order {order_id}: Current stations [{sorted(curr_gone)}], "
-                f"Required stations [{sorted(req_to_go)}], Valid the stations {dis_station_id}"
+            self.get_logger().warning(
+                f"Order {order_id}: Current stations {sorted(curr_gone)}, "
+                f"Required stations {sorted(req_to_go)}, Valid the stations {dis_station_id}"
             )
 
             remainder = req_to_go - curr_gone
@@ -483,9 +567,6 @@ class Manager(Node):
         
         with self.mutex:
             for status in self.mtrl_box_status.values():
-                if not isinstance(status, MaterialBoxStatus):
-                    self.get_logger().warning(f"Invalid status type: {type(status).__name__}")
-                    continue
                 if status.id == material_box_id and status.id != 0:
                     self.get_logger().debug(
                         f"Found bound material box {material_box_id} "
@@ -499,11 +580,12 @@ class Manager(Node):
             raise TypeError(f"Expected integer id, got {type(material_box_id).__name__}")
         
         with self.mutex:
-            for status in self.mtrl_box_status.values():
+            for order_id, status in self.mtrl_box_status.items():
+                new_status = status
                 if status.id == 0:
-                    status.id = material_box_id
-                    status.status = MaterialBoxStatus.STATUS_CLEANING
-                    order_id = status.order_id if status.order_id is not None else 0
+                    new_status.id = material_box_id
+                    new_status.status = MaterialBoxStatus.STATUS_CLEANING
+                    self.mtrl_box_status[order_id] = new_status
                     self.get_logger().info(f"Material box [{material_box_id}] has binded to order [{order_id}]")
                     return True
 
@@ -541,19 +623,21 @@ class Manager(Node):
                 f"/dispenser_station_{i}/dispense_request",
                 callback_group=cbgs[i - 1]
             )
-    
-    def _initialize_dis_station_timers(self, cbgs: List[MutuallyExclusiveCallbackGroup]) -> None:
+            self.get_logger().info(f"Dispenser station [{i}] service client is created")
+
+    def _initialize_dis_station_timers(self, period: float, cbgs: List[MutuallyExclusiveCallbackGroup]) -> None:
         """Initialize dispenser stations timers."""
         for i in range(1, self.NUM_DISPENSER_STATIONS + 1):
+            cbg_index = int(i - 1)
             self.dis_station_timers[i] = self.create_timer(
-                0.5,
+                period,
                 lambda station_id=i: asyncio.run_coroutine_threadsafe(
                     self.station_decision_cb(station_id),
                     self.loop
                 ).result(),
-                callback_group=cbgs[i - 1]
+                callback_group=cbgs[cbg_index]
             )
-            self.get_logger().debug(f"Dispenser station [{i}] timer is created")
+            self.get_logger().info(f"Dispenser station [{i}] execution timer is created")
 
     def _initialize_conveyor(self) -> None:
         """Initialize Conveyor Structure."""
@@ -570,7 +654,7 @@ class Manager(Node):
         self.conveyor.append(4)
         self.conveyor.attach_station(4, 'left', DispenserStation(7))
         self.conveyor.append(5)
-        self.conveyor.attach_station(5, 'right', DispenserStation(8))
+        self.conveyor.attach_station(5, 'left', DispenserStation(8))
         self.conveyor.append(6)
         self.conveyor.attach_station(6, 'left', DispenserStation(10))
         self.conveyor.attach_station(6, 'right', DispenserStation(9))
@@ -587,14 +671,37 @@ class Manager(Node):
 
     def get_order_id_by_mtrl_box(self, mtrl_box_id: int) -> int:
         with self.mutex:
-            for status in self.mtrl_box_status.values:
+            for status in self.mtrl_box_status.values():
                 if mtrl_box_id == status.id:
                     return status.order_id
         return 0
 
-    def get_dis_station_cli(self, id: int) -> Optional[rclpy.client.Client]:
+    def get_dis_station_cli(self, station_id: int) -> Optional[rclpy.client.Client]:
         """Safely get a dispenser station client by ID."""
-        return self.dis_station_clis.get(id)
+        return self.dis_station_clis.get(station_id)
+
+    async def send_income_mtrl_box(self, mtrl_box_id: int) -> None:
+        req = UInt8.Request()
+        req.data = mtrl_box_id
+
+        while not self.income_mtrl_box_cli.wait_for_service(timeout_sec=1.0):
+            if not rclpy.ok():
+                return None
+            self.get_logger().info("income_mtrl_box Service not available, waiting again...")
+
+        try:
+            future = self.income_mtrl_box_cli.call_async(req)
+            await future
+            res = future.result()
+            if res.success:
+                self.get_logger().info(f"income_mtrl_box id: {mtrl_box_id}")
+                return True
+            else:
+                self.get_logger().error("Failed to send income_mtrl_box")
+                return False
+        except Exception as e:
+            self.get_logger().error(f"Error writing registers: {e}")
+            return False
 
     async def read_registers(self, address: int, count: int) -> List[int]:
         req = ReadRegister.Request()
@@ -619,7 +726,7 @@ class Manager(Node):
         except Exception as e:
             self.get_logger().error(f"Error reading registers: {e}")
             return None
-        
+  
     async def write_registers(self, address: int, values: List[int]) -> None:
         req = WriteRegister.Request()
         req.address = address

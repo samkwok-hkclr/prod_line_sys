@@ -160,6 +160,8 @@ class Conveyor:
         curr_node = self.head
         chain = []
         index = 1
+        container_segment = "\t\t\t\t\t\t========container========"
+        chain.append(container_segment)
         while curr_node:
             segment_info = str()
             if curr_node.l_station:
@@ -176,7 +178,7 @@ class Conveyor:
             chain.append(segment_info)
             index += 1
             curr_node = curr_node.next
-
+        chain.append(container_segment)
         chain.reverse()
         return " \n".join(chain)
     
