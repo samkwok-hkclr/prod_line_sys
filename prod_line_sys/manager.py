@@ -2,12 +2,14 @@ import sys
 import asyncio
 from collections import deque
 from threading import Thread, Lock
-from typing import Dict, List, Optional
+from typing import Dict, List, Final, Optional
 from queue import Queue
+from array import array
 from copy import deepcopy
 import rclpy
 
 from rclpy.node import Node
+from rclpy.action import ActionServer, GoalResponse, CancelResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 
@@ -20,42 +22,25 @@ from smdps_msgs.msg import (CameraState,
                             MaterialBoxStatus, 
                             ProductionLineStatus, 
                             OrderRequest,
-                            MaterialBox)
-from smdps_msgs.srv import NewOrder, ReadRegister, WriteRegister, MoveSlidingPlatform, DispenseDrug, UInt8
+                            OrderResponse,
+                            MaterialBox,
+                            PackagingMachineStatus)
+
+from smdps_msgs.srv import (NewOrder, 
+                            ReadRegister, 
+                            WriteRegister, 
+                            MoveSlidingPlatform, 
+                            DispenseDrug, 
+                            UInt8)
+
+from smdps_msgs.action import NewOrder as NewOrderAction
 
 from .dispenser_station import DispenserStation
 from .conveyor_segment import ConveyorSegment
 from .conveyor import Conveyor
+from .const import Const
 
 class Manager(Node):
-    NUM_DISPENSER_STATIONS = 14
-    CANMERA_STATION_PLC_MAP = {
-        1: ([1, 2],   5201),
-        2: ([3, 4],   5202),
-        3: ([5, 6],   5203),
-        4: ([7],      5204),
-        5: ([8],      5208),
-        6: ([9, 10],  5205),
-        7: ([11, 12], 5206),
-        8: ([13, 14], 5207)
-    }
-    STATION_VALUE_MAP = {
-        1: [2],
-        2: [3],
-        3: [2],
-        4: [3],
-        5: [2],
-        6: [3],
-        7: [2],
-        8: [3],
-        9: [2],
-        10: [3],
-        11: [2],
-        12: [3],
-        13: [2],
-        14: [3]
-    }
-
     def __init__(self, executor):
         super().__init__("prod_line_manage")
 
@@ -66,6 +51,18 @@ class Manager(Node):
         self.qr_scan: List[CameraTrigger] = [] 
         self.elevator_queue = deque()
 
+        self.pkg_mac_status: Dict[int, PackagingMachineStatus] = {} # pkg_mac_id, PackagingMachineStatus
+        # Action server goal
+        self._goal_queue = deque()
+        self._curr_goal = None
+
+        # Constant
+        self.const: Final = Const()
+
+        # maybe unused
+        self.executor = executor
+
+        # mutex
         self.mutex = Lock()
 
         # Graph of conveyor structure
@@ -82,18 +79,18 @@ class Manager(Node):
         self.is_plc_connected = False
         self.is_releasing_mtrl_box = False
         self.is_elevator_ready = False
-        # maybe unused
-        self.executor = executor
 
         # Callback groups
         sub_cbg = MutuallyExclusiveCallbackGroup()
         srv_ser_cbg = MutuallyExclusiveCallbackGroup()
         srv_cli_cbg = MutuallyExclusiveCallbackGroup()
-        station_srv_cli_cbgs = [MutuallyExclusiveCallbackGroup() for _ in range(self.NUM_DISPENSER_STATIONS)]
+        station_srv_cli_cbgs = [MutuallyExclusiveCallbackGroup() for _ in range(self.const.NUM_DISPENSER_STATIONS)]
 
         normal_timer_cbg = MutuallyExclusiveCallbackGroup()
         qr_handle_timer_cbg = MutuallyExclusiveCallbackGroup()
-        station_timer_cbgs = [MutuallyExclusiveCallbackGroup() for _ in range(self.NUM_DISPENSER_STATIONS)]
+        station_timer_cbgs = [MutuallyExclusiveCallbackGroup() for _ in range(self.const.NUM_DISPENSER_STATIONS)]
+
+        action_ser_cbg = ReentrantCallbackGroup()
         self.get_logger().info("Callback groups are created")
 
         # Publishers
@@ -108,21 +105,35 @@ class Manager(Node):
         self.sliding_platform_ready_sub = self.create_subscription(UInt8MultiArray, "sliding_platform_ready", self.sliding_platform_ready_cb, 10, callback_group=sub_cbg)
         self.elevator_sub = self.create_subscription(Bool, "elevator", self.elevator_cb, 10, callback_group=sub_cbg)
         self.qr_scan_sub = self.create_subscription(CameraTrigger, "qr_camera_scan", self.qr_scan_cb, 10, callback_group=sub_cbg)
+        self.pkg_mac_status_sub = self.create_subscription(PackagingMachineStatus, "packaging_machine_status", self.pkg_mac_status_cb, 10, callback_group=sub_cbg)
         self.get_logger().info("Subscriptions are created")
         
-        # Service Servers
+        # Service servers
         self.new_order_srv = self.create_service(NewOrder, "new_order", self.new_order_cb, callback_group=srv_ser_cbg)
         self.move_sliding_platform = self.create_service(MoveSlidingPlatform, "move_sliding_platform", self.move_sliding_platform_cb, callback_group=srv_ser_cbg)
         self.get_logger().info("Service Servers are created")
         
-        # Service Clients
+        # Service clients
         self.read_cli = self.create_client(ReadRegister, "read_register", callback_group=srv_cli_cbg)
         self.write_cli = self.create_client(WriteRegister, "write_register", callback_group=srv_cli_cbg)
         self.income_mtrl_box_cli = self.create_client(UInt8, "income_material_box", callback_group=srv_cli_cbg)
+        self.con_mtrl_box_cli = self.create_client(UInt8, "container_material_box", callback_group=srv_cli_cbg)
         self.rel_blocking_cli = self.create_client(Trigger, "release_blocking", callback_group=srv_cli_cbg)
         self.dis_station_clis: Dict[int, rclpy.client.Client] = {} # station_id, Client
         self._initialize_dis_station_clis(station_srv_cli_cbgs)
         self.get_logger().info("Service Clients are created")
+
+        # Action server
+        self.new_order_action_ser = ActionServer(
+            self,
+            NewOrderAction,
+            "new_order_v2",
+            handle_accepted_callback=self.handle_accepted_cb,
+            execute_callback=self.execute_cb,
+            goal_callback=self.goal_cb,
+            cancel_callback=self.cancel_cb,
+            callback_group=action_ser_cbg
+        )
 
         # Timers
         self.qr_handle_timer = self.create_timer(0.5, self.qr_handle_cb, callback_group=qr_handle_timer_cbg)
@@ -158,12 +169,12 @@ class Manager(Node):
             self.is_releasing_mtrl_box = new_state
             if new_state and not prev_state:
                 conveyor_id = 1  # Must be the first conveyor
-                conveyor = self.get_conveyor(conveyor_id)
+                conveyor = self.conveyor.get_conveyor(conveyor_id)
                 if conveyor is None:
                     self.get_logger().error(f"Conveyor {conveyor_id} not found")
                     return
                 conveyor.is_occupied = True
-        self.get_logger().info(f"Material box release state: {new_state}{' (conveyor marked occupied)' if new_state else ''}")
+        self.get_logger().debug(f"Material box release state: {new_state}{' (conveyor marked occupied)' if new_state else ''}")
         
         if new_state != prev_state:
             self.get_logger().info(f"Release state changed: {prev_state} -> {new_state}")
@@ -175,7 +186,7 @@ class Manager(Node):
         Args:
             msg: UInt8MultiArray message containing platform locations for each station
         """
-        if len(msg.data) != self.NUM_DISPENSER_STATIONS:
+        if len(msg.data) != self.const.NUM_DISPENSER_STATIONS:
             self.get_logger().warning(f"Message length {len(msg.data)} doesn't match stations {len(self.dis_station)}")
             return
         
@@ -206,7 +217,7 @@ class Manager(Node):
         Args:
             msg: UInt8MultiArray message containing platform locations for each station
         """
-        if len(msg.data) != self.NUM_DISPENSER_STATIONS:
+        if len(msg.data) != self.const.NUM_DISPENSER_STATIONS:
             self.get_logger().warning(f"Message length {len(msg.data)} doesn't match stations {len(self.dis_station)}")
             return
         
@@ -238,7 +249,7 @@ class Manager(Node):
         Args:
             msg: UInt8MultiArray message containing platform ready status for each station
         """
-        if len(msg.data) != self.NUM_DISPENSER_STATIONS:
+        if len(msg.data) != self.const.NUM_DISPENSER_STATIONS:
             self.get_logger().warning(f"Message length {len(msg.data)} doesn't match stations {len(self.dis_station)}")
             return
         
@@ -283,16 +294,15 @@ class Manager(Node):
             prev_elevator_ready = self.is_elevator_ready
             self.is_elevator_ready = msg.data
 
-            # Check for state transition (False -> True)
+            # Check for state transition (0 -> 1)
             if msg.data and not prev_elevator_ready:
                 state_changed = True
                 self.elevator_queue.append(timestamp)
 
-            # Logging outside mutex to avoid holding lock longer than necessary
-            if state_changed:
-                self.get_logger().info(f"Elevator state changed 0 -> 1 at {timestamp}. Queue size: {len(self.elevator_queue)}")
-            elif msg.data != prev_elevator_ready:
-                self.get_logger().debug(f"Elevator state changed 1 -> 0. Queue size: {len(self.elevator_queue)}")
+        if state_changed:
+            self.get_logger().info(f"Elevator state changed 0 -> 1 at {timestamp}. Queue size: {len(self.elevator_queue)}")
+        elif msg.data != prev_elevator_ready:
+            self.get_logger().debug(f"Elevator state changed 1 -> 0. Queue size: {len(self.elevator_queue)}")
 
     def qr_scan_cb(self, msg: CameraTrigger) -> None:
         if not (1 <= msg.camera_id <= 11):
@@ -317,6 +327,25 @@ class Manager(Node):
                     self.get_logger().info(f"Camera {msg.camera_id} box [{msg.material_box_id}] is append to qr_scan")
         self.get_logger().info(f"Received CameraTrigger message: camera_id={msg.camera_id}, material_box_id={msg.material_box_id}")
 
+    def pkg_mac_status_cb(self, msg: PackagingMachineStatus) -> None:
+        """
+        Handle packaging machine status updates.
+        
+        Updates the status dictionary for valid packaging machine IDs (1 or 2).
+        
+        Args:
+            msg: PackagingMachineStatus message containing machine status
+        """
+        machine_id = msg.packaging_machine_id
+        if not isinstance(machine_id, int):
+            self.get_logger().error(f"Invalid packaging_machine_id type: {type(machine_id).__name__}")
+            return
+        if machine_id not in (1, 2):
+            self.get_logger().warning(f"Ignoring status update for unknown machine ID {machine_id}")
+            return
+        with self.mutex:
+            self.pkg_mac_status[machine_id] = msg
+
     # Timers callback
     async def start_order_cb(self) -> None:
         with self.mutex:
@@ -330,14 +359,15 @@ class Manager(Node):
                 order = self.recv_order.popleft()
                 self.proc_order[order.order_id] = order
 
-                status = self.mtrl_box_status[order.order_id]
-                status.start_time = self.get_clock().now().to_msg()
+                status = self.mtrl_box_status.get(order.order_id)
+                if not status:
+                    status.start_time = self.get_clock().now().to_msg()
             self.get_logger().info(">>> Added a order to processing queue")
             self.get_logger().info(">>> Removed a order from received queue")
         else:
             self.get_logger().error("Failed to call the PLC to release a material box")
     
-    def order_status_cb(self) -> None:
+    async def order_status_cb(self) -> None:
         """
         update and publish material box status messages.
         """
@@ -355,6 +385,9 @@ class Manager(Node):
         finally:
             if self.mutex.locked():
                 self.mutex.release()
+        
+        values = await self.read_registers(5030, 1)
+        self.get_logger().error(f"values: {values[0]}")
 
     async def elevator_dequeue_cb(self) -> None:
         if self.is_releasing_mtrl_box or len(self.elevator_queue) == 0:
@@ -367,27 +400,24 @@ class Manager(Node):
         
         req = Trigger.Request()
         try:
-            future = self.rel_blocking_cli.call_async(req)
-            await future
-            res = future.result()
+            res = await self.rel_blocking_cli.call_async(req)
+
             if res.success:
-                self.get_logger().info(f"release blocking successfully")
+                self.get_logger().info(f"Sent the release blocking successfully")
                 self.elevator_queue.popleft()
-                return True
-            else:
-                self.get_logger().error("Failed to send rel_blocking")
-                return False
+                return
+            
+            self.get_logger().error("Failed to send rel_blocking")
+
         except Exception as e:
             self.get_logger().error(f"Error writing registers: {e}")
-            return False
 
     async def qr_handle_cb(self) -> None:
-        to_remove = []
-        total = len(self.qr_scan)
-        if total == 0:
+        if len(self.qr_scan) == 0:
             return
-        else:
-            self.get_logger().info(f"Started to handle the QR scan, Total: {total}")
+    
+        self.get_logger().info(f"Started to handle the QR scan, Total: {len(self.qr_scan)}")
+        qr_scan_handled = []
 
         for msg in self.qr_scan[:]:
             is_completed = False
@@ -401,7 +431,7 @@ class Manager(Node):
 
             match camera_id:
                 case 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8:
-                    decide_station_ids, register_addr = self.CANMERA_STATION_PLC_MAP[camera_id]
+                    decide_station_ids, register_addr = self.const.CANMERA_STATION_PLC_MAP[camera_id]
 
                     if camera_id == 1 and not self.is_bound(material_box_id):
                         self.get_logger().error(f"The material box [{material_box_id}] does not bound")
@@ -416,7 +446,7 @@ class Manager(Node):
                     decision = self.movement_decision_v1(order_id, decide_station_ids)
                     
                     if decision in decide_station_ids:
-                        values = self.STATION_VALUE_MAP[decision]
+                        values = self.const.STATION_VALUE_MAP[decision]
                         success = await self.write_registers(register_addr, values)
                         if success:
                             if station := self.conveyor.get_station(decision):
@@ -454,38 +484,45 @@ class Manager(Node):
                 case 10:
                     # packaging machine 1
                     # if order is completed
-                    # send pkg req
-                    # else do the following
-                    success = await self.send_income_mtrl_box(material_box_id)
-                    if success:
-                        is_completed = True
-                        self.get_logger().warning(f"Sent a income materail box to packaging machine manager successfully")
+                    remainder = self.find_remainder(order_id)
+                    if len(remainder) == 0 and get_any_pkc_mac_is_idle():
+                        # send pkg req
+                        pass 
                     else:
-                        self.get_logger().error(f"Failed to send the income materail box to packaging machine manager")
+                        block_success = await self.send_income_mtrl_box(material_box_id)
+                        if block_success:
+                            self.get_logger().warning(f"Sent a income materail box to packaging machine manager successfully")
+                        else:
+                            self.get_logger().error(f"Failed to send the income materail box to packaging machine manager")
+                    
+                        elevator_success = False
+
+                        if self.is_releasing_mtrl_box:
+                            self.get_logger().debug(f"Skipped elevator movement for box {material_box_id} (currently releasing)")
+                        else: 
+                            elevator_success = await self.write_registers(5200, [1])
+                            if elevator_success:
+                                is_completed = True
+                                self.get_logger().warning(f"Sent elevator request successfully")
+                            else:
+                                self.get_logger().error(f"Failed to write to register for elevator")
+
+                        is_completed = block_success and elevator_success
+                        
                     self.get_logger().info(f"Packaging machine 1 triggered for material box [{material_box_id}]")            
                 case 11:
-                    # packaging machine 2
-                    if not self.is_releasing_mtrl_box:
-                        self.get_logger().error(f"A material box is passing the packaging machine 2")
-                        address = 5200
-                        values = [1]
-                        success = await self.write_registers(address, values)
-                        if success:
-                            is_completed = True
-                            self.get_logger().warning(f"retrieve material box successfully")
-                        else:
-                            self.get_logger().error(f"Failed to write to register {address}")
+                    success = await self.send_con_mtrl_box(material_box_id)
                     self.get_logger().info(f"Packaging machine 2 triggered for material box [{material_box_id}]")
-                    pass
                 case _:
                     self.get_logger().info(f"Received unknown camera ID: {camera_id}")
             # end of match case        
             if is_completed:
-                to_remove.append(msg)
-
+                qr_scan_handled.append(msg)
         # end of for loop self.qr_scan
+        
+        # Remove the handled qr_scan
         with self.mutex:
-            for msg in to_remove:
+            for msg in qr_scan_handled:
                 self.qr_scan.remove(msg)
                 self.get_logger().info(f"Removed message camera id: {msg.camera_id}, box: {msg.material_box_id} ")
 
@@ -513,7 +550,10 @@ class Manager(Node):
         mtrl_box_id = station.curr_mtrl_box
         order_id = self.get_order_id_by_mtrl_box(mtrl_box_id)
         order = self.proc_order[order_id]
-        status = self.mtrl_box_status[order_id]
+        status = self.mtrl_box_status.get(order_id)
+        if not status:
+            self.get_logger().error(f"No material status found with order id: {order_id}")
+            return
         curr_sliding_platform = station.curr_sliding_platform
         cmd_sliding_platform = station.cmd_sliding_platform
 
@@ -536,9 +576,7 @@ class Manager(Node):
             if conveyor.is_occupied:
                 self.get_logger().info("The conveyor is occupied. Try to move out in the next callback")
             else:
-                address = 5000 + station_id
-                values = [29]
-                success = await self.write_registers(address, values)
+                success = await self.write_registers(self.const.MOVEMENT_ADDR + station_id, [29])
                 if success:
                     with self.mutex:
                         conveyor.is_occupied = True
@@ -559,9 +597,8 @@ class Manager(Node):
                 self.get_logger().info("Dispense Service not available, waiting again...")
 
             try:
-                future = self.dis_station_clis[station_id].call_async(req)
-                await future
-                res = future.result()
+                res = await self.dis_station_clis[station_id].call_async(req)
+
                 if res.success:
                     with self.mutex:
                         station.is_completed[target_cell] = True
@@ -572,7 +609,7 @@ class Manager(Node):
                 self.get_logger().error(f"Error reading registers: {e}")
         else:
             if cmd_sliding_platform != curr_sliding_platform:
-                address = 5000 + station_id
+                address = self.const.MOVEMENT_ADDR + station_id
                 success = await self.write_registers(address, [target_cell])
                 with self.mutex:
                     station.cmd_sliding_platform = target_cell
@@ -584,7 +621,7 @@ class Manager(Node):
         
         if not isinstance(order_id, int) or not isinstance(priority, int):
             msg = f"Invalid types: order_id={type(order_id).__name__}"
-            self.get_logger().error()
+            self.get_logger().error(msg)
             res.response.success = False
             res.response.message = msg
             return res
@@ -642,7 +679,7 @@ class Manager(Node):
             res.message = f"Station ID {station_id} must be non-negative"
             return res
         
-        address = 5000 + station_id
+        address = self.const.MOVEMENT_ADDR + station_id
         values = [cell_no]
 
         success = await self.write_registers(address, values)
@@ -658,73 +695,54 @@ class Manager(Node):
 
         return res
     
-    def movement_decision_v1(self, order_id: int, dis_station_ids: List[int]) -> Optional[int]:
+    def movement_decision_v1(self, order_id: int, station_ids: List[int]) -> Optional[int]:
         """
         Determine the next station ID for an order based on requirements and availability.
         
         Args:
             order_id: The order to process
-            dis_station_ids: List of available dispenser station IDs
+            station_ids: List of available dispenser station IDs
             
         Returns:
             Optional[int]: Selected station ID if successful, None if no suitable station found
             
         Raises:
             TypeError: If inputs are of incorrect type
-            ValueError: If order_id is negative or dis_station_ids is empty
+            ValueError: If order_id is negative or station_ids is empty
         """
         if not isinstance(order_id, int):
             raise TypeError(f"Expected integer order_id, got {type(order_id).__name__}")
-        if not isinstance(dis_station_ids, list) or not all(isinstance(x, int) for x in dis_station_ids):
-            raise TypeError(f"Expected list of integers for dis_station_ids, got {type(dis_station_ids).__name__}")
+        if not isinstance(station_ids, list) or not all(isinstance(x, int) for x in station_ids):
+            raise TypeError(f"Expected list of integers for station_ids, got {type(station_ids).__name__}")
         if order_id < 0:
             raise ValueError(f"Order ID must be non-negative, got {order_id}")
-        if not dis_station_ids:
+        if not station_ids:
             raise ValueError("Dispenser station ID list cannot be empty")
         
         try:
+            remainder = self.find_remainder(order_id)
+
+            if remainder is None:
+                return self.const.GO_STRAIGHT
+
             with self.mutex:
-                status = self.mtrl_box_status.get(order_id)
-                proc = self.proc_order.get(order_id)
-                
-                # if status is None or proc is None:
-                #     raise KeyError(f"Order ID {order_id} not found")
-                if status is None or proc is None:
-                    self.get_logger().error(f"Order ID {order_id} not found in status or process data")
-                    return 0
-                
-                # Track existing dispenser stations in current material box
-                curr_mtrl_box = status.material_box
-                curr_gone = self.get_curr_gone(curr_mtrl_box)
-                # Required stations
-                req_mtrl_box = proc.material_box
-                req_to_go = self.get_req_to_go(req_mtrl_box)
-            
-                # Log current state
-                self.get_logger().warning(
-                    f"Order {order_id}: Current stations {sorted(curr_gone)}, "
-                    f"Required stations {sorted(req_to_go)}, Valid the stations {dis_station_ids}"
-                )
-
-                remainder = req_to_go - curr_gone
-
-                for station_id in dis_station_ids:
+                for station_id in station_ids:
                     station = self.conveyor.get_station(station_id)
                     if station and not station.is_occupied and station_id in remainder:
                         self.get_logger().info(f"Selected station {station_id} for order {order_id}")
                         return station_id
                 
-            self.get_logger().info(f"No suitable station found for order {order_id} from {dis_station_ids}")
-            return 0
+            self.get_logger().info(f"No suitable station found for order {order_id} from {station_ids}")
+            return self.const.GO_STRAIGHT
         except AttributeError as e:
             self.get_logger().error(f"Invalid data structure for order {order_id}: {str(e)}")
-            return 0
+            return self.const.GO_STRAIGHT
         except ValueError as e:
             self.get_logger().error(f"Set operation error for order {order_id}: {str(e)}")
-            return 0
+            return self.const.GO_STRAIGHT
         except Exception as e:
             self.get_logger().error(f"Unexpected error for order {order_id}: {str(e)}")
-            return 0
+            return self.const.GO_STRAIGHT
 
     def remove_occupied_station(self, station_ids: List[int]) -> List[int]:
         """
@@ -745,10 +763,11 @@ class Manager(Node):
             raise TypeError("All station IDs must be integers")
         
         result = []
-        for station_id in station_ids:
-            station = self.conveyor.get_station(station_id)
-            if station and not station.is_occupied:
-                result.append(station_id)
+        with self.mutex:
+            for station_id in station_ids:
+                station = self.conveyor.get_station(station_id)
+                if station and not station.is_occupied:
+                    result.append(station_id)
 
         return result
 
@@ -774,7 +793,7 @@ class Manager(Node):
             return False
         
         try:
-            acquired = self.mutex.acquire(timeout=1.0)  # 1 second timeout
+            acquired = self.mutex.acquire(timeout=1.0)
             if not acquired:
                 self.get_logger().error(f"Failed to acquire lock to check binding for {material_box_id}")
                 return False
@@ -812,7 +831,7 @@ class Manager(Node):
             raise ValueError(f"Material box ID must be non-negative, got {material_box_id}")
         
         try:
-            acquired = self.mutex.acquire(timeout=1.0)  # 1 second timeout
+            acquired = self.mutex.acquire(timeout=1.0)
             if not acquired:
                 self.get_logger().error("Failed to acquire lock for material box binding")
                 return False
@@ -858,9 +877,32 @@ class Manager(Node):
                     req_to_go.add(station_id)
         return req_to_go
 
+    def find_remainder(self, order_id: int) -> Optional[set]:
+        with self.mutex:
+            status = self.mtrl_box_status.get(order_id)
+            proc = self.proc_order.get(order_id)
+            
+            # if status is None or proc is None:
+            #     raise KeyError(f"Order ID {order_id} not found")
+            if status is None or proc is None:
+                self.get_logger().error(f"Order ID {order_id} not found in status or process data")
+                # return None
+                raise KeyError(f"Order ID {order_id} not found")
+            
+            # Track existing dispenser stations in current material box
+            curr_mtrl_box = status.material_box
+            curr_gone = self.get_curr_gone(curr_mtrl_box)
+            # Required stations
+            req_mtrl_box = proc.material_box
+            req_to_go = self.get_req_to_go(req_mtrl_box)
+        
+            self.get_logger().warning(f"Order {order_id}: Current stations {sorted(curr_gone)}, Required stations {sorted(req_to_go)}")
+
+            return req_to_go - curr_gone 
+
     def _initialize_dis_station_clis(self, cbgs: List[MutuallyExclusiveCallbackGroup]) -> None:
         """Initialize dispenser stations service clients."""
-        for i in range(1, self.NUM_DISPENSER_STATIONS + 1):
+        for i in range(1, self.const.NUM_DISPENSER_STATIONS + 1):
             self.dis_station_clis[i] = self.create_client(
                 DispenseDrug, 
                 f"/dispenser_station_{i}/dispense_request",
@@ -870,7 +912,7 @@ class Manager(Node):
 
     def _initialize_dis_station_timers(self, period: float, cbgs: List[MutuallyExclusiveCallbackGroup]) -> None:
         """Initialize dispenser stations timers."""
-        for i in range(1, self.NUM_DISPENSER_STATIONS + 1):
+        for i in range(1, self.const.NUM_DISPENSER_STATIONS + 1):
             cbg_index = int(i - 1)
             self.dis_station_timers[i] = self.create_timer(
                 period,
@@ -886,27 +928,27 @@ class Manager(Node):
         """Initialize Conveyor Structure."""
         self.conveyor = Conveyor()
         self.conveyor.append(1)
-        self.conveyor.attach_station(1, 'left', DispenserStation(1))
-        self.conveyor.attach_station(1, 'right', DispenserStation(2))
+        self.conveyor.attach_station(1, "left", DispenserStation(1))
+        self.conveyor.attach_station(1, "right", DispenserStation(2))
         self.conveyor.append(2)
-        self.conveyor.attach_station(2, 'left', DispenserStation(3))
-        self.conveyor.attach_station(2, 'right', DispenserStation(4))
+        self.conveyor.attach_station(2, "left", DispenserStation(3))
+        self.conveyor.attach_station(2, "right", DispenserStation(4))
         self.conveyor.append(3)
-        self.conveyor.attach_station(3, 'left', DispenserStation(5))
-        self.conveyor.attach_station(3, 'right', DispenserStation(6))
+        self.conveyor.attach_station(3, "left", DispenserStation(5))
+        self.conveyor.attach_station(3, "right", DispenserStation(6))
         self.conveyor.append(4)
-        self.conveyor.attach_station(4, 'left', DispenserStation(7))
+        self.conveyor.attach_station(4, "left", DispenserStation(7))
         self.conveyor.append(5)
-        self.conveyor.attach_station(5, 'left', DispenserStation(8))
+        self.conveyor.attach_station(5, "left", DispenserStation(8))
         self.conveyor.append(6)
-        self.conveyor.attach_station(6, 'left', DispenserStation(10))
-        self.conveyor.attach_station(6, 'right', DispenserStation(9))
+        self.conveyor.attach_station(6, "left", DispenserStation(10))
+        self.conveyor.attach_station(6, "right", DispenserStation(9))
         self.conveyor.append(7)
-        self.conveyor.attach_station(7, 'left', DispenserStation(12))
-        self.conveyor.attach_station(7, 'right', DispenserStation(11))
+        self.conveyor.attach_station(7, "left", DispenserStation(12))
+        self.conveyor.attach_station(7, "right", DispenserStation(11))
         self.conveyor.append(8)
-        self.conveyor.attach_station(8, 'left', DispenserStation(14))
-        self.conveyor.attach_station(8, 'right', DispenserStation(13))
+        self.conveyor.attach_station(8, "left", DispenserStation(14))
+        self.conveyor.attach_station(8, "right", DispenserStation(13))
         self.conveyor.append(9) # Vision
         self.conveyor.append(10) # Packaging Machine 1
         self.conveyor.append(11) # Packaging Machine 2
@@ -932,7 +974,7 @@ class Manager(Node):
             raise ValueError(f"Material box ID must be non-negative, got {mtrl_box_id}")
         
         try:
-            acquired = self.mutex.acquire(timeout=1.0)  # 5 second timeout
+            acquired = self.mutex.acquire(timeout=1.0)
             if not acquired:
                 self.get_logger().error(f"Failed to acquire lock for mtrl_box_id {mtrl_box_id}")
                 return None
@@ -951,11 +993,32 @@ class Manager(Node):
             if self.mutex.locked():
                 self.mutex.release()
 
+    def get_any_pkc_mac_is_idle(self) -> bool:
+        """
+        Check if any packaging machine is in idle state.
+        
+        Returns:
+            bool: True if at least one machine is idle, False otherwise
+        """
+        with self.mutex:
+            if not self.pkg_mac_status:
+                self.get_logger().debug("No packaging machines registered")
+                return False
+
+            for status in self.pkg_mac_status.values():
+                if status.packaging_machine_state == PackagingMachineStatus.IDLE:
+                    self.get_logger().debug(f"Found idle packaging machine {status.packaging_machine_id}")
+                    return True
+        
+        self.get_logger().warning("No idle packaging machines found")
+	    return False
+
+
     def get_dis_station_cli(self, station_id: int) -> Optional[rclpy.client.Client]:
         """Safely get a dispenser station client by ID."""
         return self.dis_station_clis.get(station_id)
 
-    async def send_income_mtrl_box(self, mtrl_box_id: int) -> None:
+    async def send_income_mtrl_box(self, mtrl_box_id: int) -> Optional[bool]:
         """
         Asynchronously send a material box ID to the income service.
         
@@ -983,20 +1046,15 @@ class Manager(Node):
             self.get_logger().info("income_mtrl_box Service not available, waiting again...")
 
         try:
-            future = self.income_mtrl_box_cli.call_async(req)
-            # await future
-            # res = future.result()
-            res = await asyncio.wait_for(future, timeout=1.0)
-
+            res = await self.income_mtrl_box_cli.call_async(req)
+  
             if res.success:
                 self.get_logger().info(f"Successfully sent material box ID: {mtrl_box_id}")
                 return True
         
             self.get_logger().error(f"Service call succeeded but reported failure for ID: {mtrl_box_id}")
             return False
-        except asyncio.TimeoutError:
-            self.get_logger().error(f"Service call timeout for material box ID: {mtrl_box_id}")
-            return False
+
         except AttributeError as e:
             self.get_logger().error(f"Invalid service response for ID {mtrl_box_id}: {str(e)}")
             return False
@@ -1004,7 +1062,51 @@ class Manager(Node):
             self.get_logger().error(f"Service call failed for ID {mtrl_box_id}: {str(e)}")
             return False
 
-    async def read_registers(self, address: int, count: int) -> Optional[List[int]]:
+    async def send_con_mtrl_box(self, mtrl_box_id: int) -> Optional[bool]:
+        """
+        Asynchronously send a material box ID to the con service.
+        
+        Args:
+            mtrl_box_id: The material box ID to send
+            
+        Returns:
+            bool: True if successfully sent, False otherwise
+            
+        Raises:
+            TypeError: If mtrl_box_id is not an integer
+            ValueError: If mtrl_box_id is negative
+        """
+        if not isinstance(mtrl_box_id, int):
+            raise TypeError(f"Expected integer mtrl_box_id, got {type(mtrl_box_id).__name__}")
+        if mtrl_box_id < 0:
+            raise ValueError(f"Material box ID must be non-negative, got {mtrl_box_id}")
+        
+        req = UInt8.Request()
+        req.data = mtrl_box_id
+
+        while not self.con_mtrl_box_cli.wait_for_service(timeout_sec=1.0):
+            if not rclpy.ok():
+                return None
+            self.get_logger().info("container_material_box Service not available, waiting again...")
+
+        try:
+            res = await self.con_mtrl_box_cli.call_async(req)
+  
+            if res.success:
+                self.get_logger().info(f"Successfully sent material box ID: {mtrl_box_id}")
+                return True
+        
+            self.get_logger().error(f"Service call succeeded but reported failure for ID: {mtrl_box_id}")
+            return False
+
+        except AttributeError as e:
+            self.get_logger().error(f"Invalid service response for ID {mtrl_box_id}: {str(e)}")
+            return False
+        except Exception as e:
+            self.get_logger().error(f"Service call failed for ID {mtrl_box_id}: {str(e)}")
+            return False
+
+    async def read_registers(self, address: int, count: int) -> Optional[array]:
         """
         Asynchronously read a specified number of registers from a given address.
         
@@ -1034,23 +1136,19 @@ class Manager(Node):
             self.get_logger().info("read_registers Service not available, waiting again...")
 
         try:
-            future = self.read_cli.call_async(req)
-            # await future
-            # res = future.result()
-            res = await asyncio.wait_for(future, timeout=1.0)
+            res = await self.read_cli.call_async(req)
+
             if res.success:
-                if not isinstance(res.values, list):
+                if not isinstance(res.values, array):
                     self.get_logger().error("Invalid response format: values not a list")
                     return None
-                self.get_logger().info(f"Successfully read {len(res.values)} registers from address {address}")
+
+                self.get_logger().debug(f"Successfully read {len(res.values)} registers from address {address}")
                 return res.values
             
             self.get_logger().error(f"Service reported failure reading registers at {address}")
             return None
 
-        except asyncio.TimeoutError:
-            self.get_logger().error(f"Timeout reading registers at address {address}")
-            return None
         except AttributeError as e:
             self.get_logger().error(f"Invalid response format for address {address}: {str(e)}")
             return None
@@ -1092,19 +1190,15 @@ class Manager(Node):
             self.get_logger().info("write_registers Service not available, waiting again...")
 
         try:
-            future = self.write_cli.call_async(req)
-            # await future
-            # res = future.result()
-            res = await asyncio.wait_for(future, timeout=1.0) 
+            res = await self.write_cli.call_async(req)
+
             if res.success:
-                self.get_logger().info(f"Successfully wrote {len(values)} registers at address {address}: {values}")
+                self.get_logger().debug(f"Successfully wrote {len(values)} registers at address {address}: {values}")
                 return True
                 
             self.get_logger().error(f"Service reported failure writing {len(values)} registers at {address}")
             return False
-        except asyncio.TimeoutError:
-            self.get_logger().error(f"Timeout writing registers at address {address}")
-            return False
+
         except AttributeError as e:
             self.get_logger().error(f"Invalid response format for address {address}: {str(e)}")
             return False
@@ -1112,6 +1206,109 @@ class Manager(Node):
             self.get_logger().error(f"Failed to write registers at {address}: {str(e)}")
             return False
     
+    # Action Server Callbacks
+    def handle_accepted_cb(self, goal_handle):
+        """Start or defer execution of an already accepted goal."""
+        with self.mutex:
+            if self._curr_goal is not None:
+                # Put incoming goal in the queue
+                self._goal_queue.append(goal_handle)
+                self.get_logger().info("Goal put in the queue")
+            else:
+                # Start goal execution right away
+                self._curr_goal = goal_handle
+                self._curr_goal.execute()
+
+    def goal_cb(self, goal_request):
+        """Accept or reject a client request to begin an action."""
+        self.get_logger().info("Received a goal, try to proceess the goal")
+
+        # TODO: try to valid the acceptance
+        if False:
+            return GoalResponse.REJECT
+
+        return GoalResponse.ACCEPT
+
+    def cancel_cb(self, goal_handle):
+        """Accept or reject a client request to cancel an action."""
+        self.get_logger().info("Received cancel request")
+        return CancelResponse.ACCEPT
+
+    async def execute_cb(self, goal_handle):
+        """Execute a goal for the NewOrderAction."""
+        try:
+            goal = goal_handle.get_goal()
+            req = goal.request
+            result = NewOrderAction.Result()
+            feedback_msg = NewOrderAction.Feedback()
+            
+            order_id = req.order_id
+            priority = req.priority
+
+            self.get_logger().info(f"Received NewOrder by action: order_id={order_id}, priority={priority}")
+
+            msg = MaterialBoxStatus(
+                creation_time=self.get_clock().now().to_msg(),
+                id=0,
+                status=MaterialBoxStatus.STATUS_INITIALIZING,
+                priority=priority,
+                order_id=order_id
+            )
+
+            with self.mutex:
+                self.mtrl_box_status[order_id] = msg
+                self.recv_order.append(req)
+
+            feedback_msg.running = True
+            retries = 0
+            MAX_RETRY = 600
+
+            for _ in range(1, MAX_RETRY):
+                if not rclpy.ok():
+                    self.get_logger().warn("ROS2 shutdown detected, aborting goal")
+                    break
+
+                if goal_handle.is_cancel_requested:
+                    goal_handle.canceled()
+                    self.get_logger().info(f"Goal canceled for order_id={order_id}")
+                    return result
+
+                status = self.mtrl_box_status.get(order_id)
+                if status is None:
+                    self.get_logger().error(f"Status for order_id={order_id} not found")
+                    result.response.success = False
+                    result.response.message = "Order status lost"
+                    break
+
+                if status.id != 0:
+                    result.response.material_box_id = status.id
+                    result.response.success = True
+                    break
+
+                self.get_logger().warning(f"Waiting for material box ID for order_id={order_id} ({retries} retries)...")
+                goal_handle.publish_feedback(feedback_msg)
+                retries += 1
+                asyncio.sleep(1)
+
+            if retries >= MAX_RETRY:
+                result.response.success = False
+                result.response.message = "Material box assignment timed out"
+                self.get_logger().error(f"Timeout after {retries} retries for order_id={order_id}")
+
+            goal_handle.succeed()
+            return result
+
+        finally:
+            with self.mutex:
+                try:
+                    # Start execution of the next goal in the queue.
+                    self._curr_goal = self._goal_queue.popleft()
+                    self.get_logger().info("Next goal pulled from the queue")
+                    self._curr_goal.execute()
+                except IndexError:
+                    # No goal in the queue.
+                    self._curr_goal = None
+
     def run_loop(self):
         """Run the asyncio event loop in a dedicated thread."""
         asyncio.set_event_loop(self.loop)
@@ -1119,6 +1316,8 @@ class Manager(Node):
         self.loop.run_forever()
 
     def destroy_node(self):
+        self.new_order_action_ser.destroy()
+
         if self.loop.is_running():
             self.loop.call_soon_threadsafe(self.loop.stop)
             self.get_logger().info("Removed loop successfully")
