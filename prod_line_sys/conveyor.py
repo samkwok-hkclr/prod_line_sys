@@ -160,7 +160,7 @@ class Conveyor:
         curr_node = self.head
         chain = []
         index = 1
-        container_segment = "\t\t\t\t\t\t========container========"
+        container_segment = "\t\t\t\t\t\t========     container     ========"
         chain.append(container_segment)
         while curr_node:
             segment_info = str()
@@ -174,7 +174,7 @@ class Conveyor:
             if curr_node.r_station:
                 segment_info += f"\t<<<[{curr_node.r_station}]"
             
-            segment_info += "\n\t\t\t\t\t\t" + "^" * len(core)
+            segment_info += ("\n\t\t\t\t\t\t" + "^" * len(core)) * 2
             chain.append(segment_info)
             index += 1
             curr_node = curr_node.next

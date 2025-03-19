@@ -4,6 +4,7 @@ from collections import deque
 from threading import Thread, Lock
 from typing import Dict, List, Optional
 from queue import Queue
+from copy import deepcopy
 import rclpy
 
 from rclpy.node import Node
@@ -38,6 +39,22 @@ class Manager(Node):
         7: ([11, 12], 5206),
         8: ([13, 14], 5207)
     }
+    STATION_VALUE_MAP = {
+        1: [2],
+        2: [3],
+        3: [2],
+        4: [3],
+        5: [2],
+        6: [3],
+        7: [2],
+        8: [3],
+        9: [2],
+        10: [3],
+        11: [2],
+        12: [3],
+        13: [2],
+        14: [3]
+    }
 
     def __init__(self, executor):
         super().__init__("prod_line_manage")
@@ -47,7 +64,7 @@ class Manager(Node):
         self.proc_order: Dict[int, OrderRequest] = {} # order_id, OrderRequest
         self.mtrl_box_status: Dict[int, MaterialBoxStatus] = {} # order_id, MaterialBoxStatus
         self.qr_scan: List[CameraTrigger] = [] 
-        self.elevator_queue = Queue()
+        self.elevator_queue = deque()
 
         self.mutex = Lock()
 
@@ -116,7 +133,7 @@ class Manager(Node):
             lambda: asyncio.run_coroutine_threadsafe(self.elevator_dequeue_cb(), self.loop).result(),
             callback_group=normal_timer_cbg)
         self.dis_station_timers: Dict[int, rclpy.Timer.Timer] = {}
-        self._initialize_dis_station_timers(1.0, station_timer_cbgs)
+        self._initialize_dis_station_timers(0.5, station_timer_cbgs)
         self.get_logger().info("Timers are created")
         
         self.get_logger().info("Produation Line Manager Node started")
@@ -129,46 +146,85 @@ class Manager(Node):
             self.get_logger().error(f"Received: PLC is disconnected")
 
     def releasing_mtrl_box_cb(self, msg: Bool) -> None:
+        """
+        Handle material box release status updates.
+        
+        Updates the release state and marks conveyor as occupied when releasing.
+        """
+        new_state = bool(msg.data)
+        
         with self.mutex:
-            self.is_releasing_mtrl_box = bool(msg.data)
-            if self.is_releasing_mtrl_box:
-                conveyor = self.conveyor.get_conveyor(1)
+            prev_state = self.is_releasing_mtrl_box
+            self.is_releasing_mtrl_box = new_state
+            if new_state and not prev_state:
+                conveyor_id = 1  # Must be the first conveyor
+                conveyor = self.get_conveyor(conveyor_id)
+                if conveyor is None:
+                    self.get_logger().error(f"Conveyor {conveyor_id} not found")
+                    return
                 conveyor.is_occupied = True
-        self.get_logger().debug(f"Received releasing material box state: {self.is_releasing_mtrl_box}")
+        self.get_logger().info(f"Material box release state: {new_state}{' (conveyor marked occupied)' if new_state else ''}")
+        
+        if new_state != prev_state:
+            self.get_logger().info(f"Release state changed: {prev_state} -> {new_state}")
 
     def sliding_platform_curr_cb(self, msg: UInt8MultiArray) -> None:
+        """
+        Update current sliding platform positions for all dispenser stations.
+        
+        Args:
+            msg: UInt8MultiArray message containing platform locations for each station
+        """
         if len(msg.data) != self.NUM_DISPENSER_STATIONS:
             self.get_logger().warning(f"Message length {len(msg.data)} doesn't match stations {len(self.dis_station)}")
             return
+        
         try:
+            updated_stations = []
             with self.mutex:
-                for i, platform_location in enumerate(msg.data, start=1):
-                    station = self.conveyor.get_station(i)
+                for station_id, platform_location in enumerate(msg.data, start=1):
+                    station = self.conveyor.get_station(station_id)
                     if station is None:
-                        self.get_logger().warning(f"No station found for ID {i} <<<< 1")
+                        self.get_logger().warning(f"No station found for ID {station_id} <<<< 1")
                         continue
                     station.curr_sliding_platform = platform_location
-            
-            self.get_logger().debug(f"Received sliding platform message: {msg}")
+                    updated_stations.append((station_id, platform_location))
+
+            if updated_stations:
+                self.get_logger().debug(f"Updated {len(updated_stations)} sliding platforms location: {dict(updated_stations)}")
+            else:
+                self.get_logger().warning("No stations updated from platform message")
         except AttributeError as e:
             self.get_logger().error(f"Invalid message format: {e}")
         except Exception as e:
             self.get_logger().error(f"Error processing sliding platform message: {e}")
     
     def sliding_platform_cmd_cb(self, msg: UInt8MultiArray) -> None:
+        """
+        Update command sliding platform positions for all dispenser stations.
+        
+        Args:
+            msg: UInt8MultiArray message containing platform locations for each station
+        """
         if len(msg.data) != self.NUM_DISPENSER_STATIONS:
             self.get_logger().warning(f"Message length {len(msg.data)} doesn't match stations {len(self.dis_station)}")
             return
+        
         try:
+            updated_stations = []
             with self.mutex:
-                for i, state in enumerate(msg.data, start=1):
-                    station = self.conveyor.get_station(i)
+                for station_id, state in enumerate(msg.data, start=1):
+                    station = self.conveyor.get_station(station_id)
                     if station is None:
-                        self.get_logger().warning(f"No station found for ID {i} <<<< 2")
+                        self.get_logger().warning(f"No station found for ID {station_id} <<<< 2")
                         continue
                     station.cmd_sliding_platform = state
-            
-            self.get_logger().debug(f"Received sliding platform ready message: {msg}")
+                    updated_stations.append((station_id, state))
+
+            if updated_stations:
+                self.get_logger().debug(f"Updated {len(updated_stations)} sliding platforms command: {dict(updated_stations)}")
+            else:
+                self.get_logger().warning("No stations updated from platform message")
         except AttributeError as e:
             self.get_logger().error(f"Invalid message format: {e}")
         except Exception as e:
@@ -176,20 +232,35 @@ class Manager(Node):
         return
 
     def sliding_platform_ready_cb(self, msg: UInt8MultiArray) -> None:
+        """
+        Update sliding platform ready status for all dispenser stations.
+        
+        Args:
+            msg: UInt8MultiArray message containing platform ready status for each station
+        """
         if len(msg.data) != self.NUM_DISPENSER_STATIONS:
             self.get_logger().warning(f"Message length {len(msg.data)} doesn't match stations {len(self.dis_station)}")
             return
+        
         try:
+            updated_stations = []
             with self.mutex:
-                for i, platform_ready_state in enumerate(msg.data, start=1):
-                    station = self.conveyor.get_station(i)
+                for station_id, platform_ready_state in enumerate(msg.data, start=1):
+                    station = self.conveyor.get_station(station_id)
                     if station is None:
-                        self.get_logger().warning(f"No station found for ID {i} <<<< 2")
+                        self.get_logger().warning(f"No station found for ID {station_id} <<<< 3")
                         continue
                     station.is_platform_ready = platform_ready_state
+                    updated_stations.append((station_id, platform_ready_state))
+
                     if station.is_platform_ready != 0:
-                        self.get_logger().debug(f"Station [{i}] platform is ready!")
+                        self.get_logger().debug(f"Station [{station_id}] platform is ready!")
             
+            if updated_stations:
+                self.get_logger().debug(f"Updated {len(updated_stations)} sliding platforms ready state: {dict(updated_stations)}")
+            else:
+                self.get_logger().warning("No stations updated from platform message")
+
             self.get_logger().debug(f"Received sliding platform ready message: {msg}")
         except AttributeError as e:
             self.get_logger().error(f"Invalid message format: {e}")
@@ -197,22 +268,37 @@ class Manager(Node):
             self.get_logger().error(f"Error processing sliding platform ready message: {e}")
         return
     
-    def elevator_cb(self, msg: Bool):
+    def elevator_cb(self, msg: Bool) -> None:
+        """
+        Handle elevator status update messages.
+        
+        Updates elevator ready state and manages queue when state changes from not ready to ready.
+        
+        Args:
+            msg: Bool message containing elevator ready status
+        """
+        state_changed = False
+        timestamp = self.get_clock().now()
         with self.mutex:
-            # Store the previous state
             prev_elevator_ready = self.is_elevator_ready
-            # Update the state
             self.is_elevator_ready = msg.data
-            if msg and msg.data == True and prev_elevator_ready == False:
-                self.elevator_queue.put(self.get_clock().now())
-                self.get_logger().warning(f"A state change of elevator 0 -> 1")
 
+            # Check for state transition (False -> True)
+            if msg.data and not prev_elevator_ready:
+                state_changed = True
+                self.elevator_queue.append(timestamp)
+
+            # Logging outside mutex to avoid holding lock longer than necessary
+            if state_changed:
+                self.get_logger().info(f"Elevator state changed 0 -> 1 at {timestamp}. Queue size: {len(self.elevator_queue)}")
+            elif msg.data != prev_elevator_ready:
+                self.get_logger().debug(f"Elevator state changed 1 -> 0. Queue size: {len(self.elevator_queue)}")
 
     def qr_scan_cb(self, msg: CameraTrigger) -> None:
-        if not 1 <= msg.camera_id <= 11:
+        if not (1 <= msg.camera_id <= 11):
             self.get_logger().error(f"Received undefined camera_id: {msg.camera_id}")
             return
-        if not 1 <= msg.material_box_id <= 20:
+        if not (1 <= msg.material_box_id <= 20):
             self.get_logger().error(f"Received undefined material_box_id: {msg.material_box_id}")
             return
         
@@ -251,33 +337,42 @@ class Manager(Node):
         else:
             self.get_logger().error("Failed to call the PLC to release a material box")
     
-    async def order_status_cb(self) -> None:
+    def order_status_cb(self) -> None:
+        """
+        update and publish material box status messages.
+        """
         curr_time = self.get_clock().now().to_msg()
-        with self.mutex:
-            for status in self.mtrl_box_status.values():
-                if isinstance(status, MaterialBoxStatus):
-                    status.header.stamp = curr_time
-                    self.mtrl_box_status_pub.publish(status)
-                else:
-                    self.get_logger().warning(f"Invalid status type found: {type(status).__name__}")
+        try:
+            acquired = self.mutex.acquire(timeout=1.0)
+            if not acquired:
+                self.get_logger().error("Failed to acquire mutex for status update")
+                return
+            for order_id, status in self.mtrl_box_status.items():
+                status.header.stamp = curr_time
+                self.mtrl_box_status_pub.publish(status)
+        except Exception as e:
+            self.get_logger().error(f"Error in order_status_cb: {str(e)}")
+        finally:
+            if self.mutex.locked():
+                self.mutex.release()
 
     async def elevator_dequeue_cb(self) -> None:
-        if self.is_releasing_mtrl_box or self.elevator_queue.empty():
+        if self.is_releasing_mtrl_box or len(self.elevator_queue) == 0:
             return
-        req = Trigger.Request()
-
+        
         while not self.rel_blocking_cli.wait_for_service(timeout_sec=1.0):
             if not rclpy.ok():
                 return None
             self.get_logger().info("rel_blocking Service not available, waiting again...")
-
+        
+        req = Trigger.Request()
         try:
             future = self.rel_blocking_cli.call_async(req)
             await future
             res = future.result()
             if res.success:
                 self.get_logger().info(f"release blocking successfully")
-                self.elevator_queue.get()
+                self.elevator_queue.popleft()
                 return True
             else:
                 self.get_logger().error("Failed to send rel_blocking")
@@ -299,6 +394,7 @@ class Manager(Node):
             camera_id = msg.camera_id
             material_box_id = msg.material_box_id
             self.get_logger().info(f"camera id: {camera_id}, material box id: {material_box_id}")
+
             order_id = self.get_order_id_by_mtrl_box(material_box_id)
             if order_id == 0:
                 self.get_logger().info(f"The material box [{material_box_id}] does not bound to any order!")
@@ -316,11 +412,11 @@ class Manager(Node):
                             self.get_logger().warning(f"Failed to bind material box {material_box_id}")
                             continue
 
-                    # decide_station_ids = self.remove_occupied_station(decide_station_ids)
+                    decide_station_ids = self.remove_occupied_station(decide_station_ids)
                     decision = self.movement_decision_v1(order_id, decide_station_ids)
                     
                     if decision in decide_station_ids:
-                        values = [2] if decision == decide_station_ids[0] else [3]
+                        values = self.STATION_VALUE_MAP[decision]
                         success = await self.write_registers(register_addr, values)
                         if success:
                             if station := self.conveyor.get_station(decision):
@@ -363,8 +459,9 @@ class Manager(Node):
                     success = await self.send_income_mtrl_box(material_box_id)
                     if success:
                         is_completed = True
+                        self.get_logger().warning(f"Sent a income materail box to packaging machine manager successfully")
                     else:
-                        pass
+                        self.get_logger().error(f"Failed to send the income materail box to packaging machine manager")
                     self.get_logger().info(f"Packaging machine 1 triggered for material box [{material_box_id}]")            
                 case 11:
                     # packaging machine 2
@@ -374,9 +471,8 @@ class Manager(Node):
                         values = [1]
                         success = await self.write_registers(address, values)
                         if success:
-                            with self.mutex:
-                                is_completed = True
-                            self.get_logger().error(f"retrieve material box successfully")
+                            is_completed = True
+                            self.get_logger().warning(f"retrieve material box successfully")
                         else:
                             self.get_logger().error(f"Failed to write to register {address}")
                     self.get_logger().info(f"Packaging machine 2 triggered for material box [{material_box_id}]")
@@ -483,41 +579,120 @@ class Manager(Node):
 
     # Service Server callback
     def new_order_cb(self, req, res):
-        self.get_logger().info(f"Received NewOrder request: order_id={req.request.order_id}")
-        self.recv_order.append(req.request)
-        msg = MaterialBoxStatus()
-        msg.creation_time = self.get_clock().now().to_msg()
-        msg.id = 0
-        msg.status = MaterialBoxStatus.STATUS_INITIALIZING
-        msg.priority = req.request.priority
-        msg.order_id = req.request.order_id
+        order_id = req.request.order_id
+        priority = req.request.priority
+        
+        if not isinstance(order_id, int) or not isinstance(priority, int):
+            msg = f"Invalid types: order_id={type(order_id).__name__}"
+            self.get_logger().error()
+            res.response.success = False
+            res.response.message = msg
+            return res
+        if order_id < 0:
+            msg = f"Invalid order_id: {order_id} (must be non-negative)"
+            self.get_logger().error(msg)
+            res.response.success = False
+            res.response.message = msg
+            return res
+        
+        self.get_logger().info(f"Received NewOrder request: order_id={order_id}, priority={priority}")
+
+        msg = MaterialBoxStatus(
+            creation_time=self.get_clock().now().to_msg(),
+            id=0,
+            status=MaterialBoxStatus.STATUS_INITIALIZING,
+            priority=priority,
+            order_id=order_id
+        )
+
         with self.mutex:
             self.mtrl_box_status[req.request.order_id] = msg
+            self.recv_order.append(req.request)
+
         res.response.success = True
+        self.get_logger().debug(f"Successfully processed order {order_id}")
         return res
     
     async def move_sliding_platform_cb(self, req, res):
-        if 0 <= req.cell_no or req.cell_no >= 30:
-            self.get_logger().error("Invalid cell_no!")
+        """
+        Asynchronously move the sliding platform to a specified cell for a dispense station.
+        
+        Args:
+            req: Request object containing cell_no and dispense_station_id
+            res: Response object to be populated with results
+            
+        Returns:
+            MoveResponse: Updated response with success status and message
+        """
+        cell_no = req.cell_no
+        station_id = req.dispense_station_id
+
+        if not isinstance(cell_no, int) or not isinstance(station_id, int):
+            self.get_logger().error(f"Invalid parameter types: cell_no={type(cell_no).__name__}, station_id={type(station_id).__name__}")
+            res.message = "Parameters must be integers"
             return res
-        address = 5000 + req.dispense_station_id
-        values = [req.cell_no]
+        
+        if not (0 < cell_no < 30):
+            self.get_logger().error(f"Invalid cell_no {cell_no}: must be between 1 and 29")
+            res.message = f"Cell number {cell_no} out of range (1-29)"
+            return res
+
+        if station_id < 0:
+            self.get_logger().error(f"Invalid dispense_station_id {station_id}: must be non-negative")
+            res.message = f"Station ID {station_id} must be non-negative"
+            return res
+        
+        address = 5000 + station_id
+        values = [cell_no]
+
         success = await self.write_registers(address, values)
+        res.success = success
+
         if success:
-            res.success = True
+            self.get_logger().info(f"Successfully moved sliding platform to cell {cell_no} at station {station_id}")
+            res.message = "Platform movement successful"
         else:
-            res.message = f"Failed to write to register {address} with cell_no {req.cell_no}"
+            error_msg = f"Failed to write to register {address} with cell_no {cell_no}"
+            self.get_logger().error(error_msg)
+            res.message = error_msg
+
         return res
     
-    def movement_decision_v1(self, order_id: int, dis_station_id: List[int]) -> int:
+    def movement_decision_v1(self, order_id: int, dis_station_ids: List[int]) -> Optional[int]:
+        """
+        Determine the next station ID for an order based on requirements and availability.
+        
+        Args:
+            order_id: The order to process
+            dis_station_ids: List of available dispenser station IDs
+            
+        Returns:
+            Optional[int]: Selected station ID if successful, None if no suitable station found
+            
+        Raises:
+            TypeError: If inputs are of incorrect type
+            ValueError: If order_id is negative or dis_station_ids is empty
+        """
+        if not isinstance(order_id, int):
+            raise TypeError(f"Expected integer order_id, got {type(order_id).__name__}")
+        if not isinstance(dis_station_ids, list) or not all(isinstance(x, int) for x in dis_station_ids):
+            raise TypeError(f"Expected list of integers for dis_station_ids, got {type(dis_station_ids).__name__}")
+        if order_id < 0:
+            raise ValueError(f"Order ID must be non-negative, got {order_id}")
+        if not dis_station_ids:
+            raise ValueError("Dispenser station ID list cannot be empty")
+        
         try:
             with self.mutex:
                 status = self.mtrl_box_status.get(order_id)
                 proc = self.proc_order.get(order_id)
                 
+                # if status is None or proc is None:
+                #     raise KeyError(f"Order ID {order_id} not found")
                 if status is None or proc is None:
-                    raise KeyError(f"Order ID {order_id} not found")
-                    
+                    self.get_logger().error(f"Order ID {order_id} not found in status or process data")
+                    return 0
+                
                 # Track existing dispenser stations in current material box
                 curr_mtrl_box = status.material_box
                 curr_gone = self.get_curr_gone(curr_mtrl_box)
@@ -525,72 +700,140 @@ class Manager(Node):
                 req_mtrl_box = proc.material_box
                 req_to_go = self.get_req_to_go(req_mtrl_box)
             
-            # Log current state
-            self.get_logger().warning(
-                f"Order {order_id}: Current stations {sorted(curr_gone)}, "
-                f"Required stations {sorted(req_to_go)}, Valid the stations {dis_station_id}"
-            )
+                # Log current state
+                self.get_logger().warning(
+                    f"Order {order_id}: Current stations {sorted(curr_gone)}, "
+                    f"Required stations {sorted(req_to_go)}, Valid the stations {dis_station_ids}"
+                )
 
-            remainder = req_to_go - curr_gone
-            with self.mutex:
-                for id in dis_station_id:
-                    station = self.conveyor.get_station(id)
-                    if station and not station.is_occupied and id in remainder:
-                        self.get_logger().info(f"Selected station {id} for order {order_id}")
-                        return id
+                remainder = req_to_go - curr_gone
+
+                for station_id in dis_station_ids:
+                    station = self.conveyor.get_station(station_id)
+                    if station and not station.is_occupied and station_id in remainder:
+                        self.get_logger().info(f"Selected station {station_id} for order {order_id}")
+                        return station_id
                 
-            self.get_logger().info(f"The stations [{dis_station_id}] are not requested for order {order_id}")
+            self.get_logger().info(f"No suitable station found for order {order_id} from {dis_station_ids}")
             return 0
         except AttributeError as e:
-            self.get_logger().error(f"Invalid material box structure: {e}")
+            self.get_logger().error(f"Invalid data structure for order {order_id}: {str(e)}")
             return 0
-        except KeyError as e:
-            self.get_logger().error(f"Data access error: {e}")
+        except ValueError as e:
+            self.get_logger().error(f"Set operation error for order {order_id}: {str(e)}")
             return 0
         except Exception as e:
-            self.get_logger().error(f"Unexpected error in station decision: {e}")
+            self.get_logger().error(f"Unexpected error for order {order_id}: {str(e)}")
             return 0
 
     def remove_occupied_station(self, station_ids: List[int]) -> List[int]:
-        to_remove = []
-        for id in station_ids[:]:
-            station = self.conveyor.get_station(id)
-            if station and station.is_occupied:
-                to_remove.append(id)
-        for id in station_ids:
-            station_ids.remove(id)
-        return station_ids
+        """
+        Remove occupied station IDs from the input list and return remaining IDs.
+        
+        Args:
+            station_ids: List of station IDs to check
+            
+        Returns:
+            List[int]: List of station IDs that are not occupied
+            
+        Raises:
+            TypeError: If station_ids is not a list or contains non-integer values
+        """
+        if not isinstance(station_ids, list):
+            raise TypeError(f"Expected list, got {type(station_ids).__name__}")
+        if not all(isinstance(station_id, int) for station_id in station_ids):
+            raise TypeError("All station IDs must be integers")
+        
+        result = []
+        for station_id in station_ids:
+            station = self.conveyor.get_station(station_id)
+            if station and not station.is_occupied:
+                result.append(station_id)
+
+        return result
 
     def is_bound(self, material_box_id: int) -> bool:
-        if not isinstance(material_box_id, int):
-            raise TypeError(f"Unexpected id >>> {type(material_box_id).__name__}")
+        """
+        Check if a material box is currently bound to any order.
         
-        with self.mutex:
-            for status in self.mtrl_box_status.values():
-                if status.id == material_box_id and status.id != 0:
-                    self.get_logger().debug(
-                        f"Found bound material box {material_box_id} "
-                        f"with order {status.order_id}"
-                    )
-                    return True
-        return False
-
-    def bind_mtrl_box(self, material_box_id: int) -> bool:
+        Args:
+            material_box_id: The ID of the material box to check
+            
+        Returns:
+            bool: True if the material box is bound, False otherwise
+            
+        Raises:
+            TypeError: If material_box_id is not an integer
+            ValueError: If material_box_id is negative
+        """
         if not isinstance(material_box_id, int):
             raise TypeError(f"Expected integer id, got {type(material_box_id).__name__}")
+        if material_box_id < 0:
+            raise ValueError(f"Material box ID must be non-negative, got {material_box_id}")
+        if material_box_id == 0:
+            return False
         
-        with self.mutex:
+        try:
+            acquired = self.mutex.acquire(timeout=1.0)  # 1 second timeout
+            if not acquired:
+                self.get_logger().error(f"Failed to acquire lock to check binding for {material_box_id}")
+                return False
+
             for order_id, status in self.mtrl_box_status.items():
-                new_status = status
+                if status.id == material_box_id:
+                    self.get_logger().debug(f"Found bound material box {material_box_id} with order {order_id}")
+                    return True
+            return False
+        except Exception as e:
+            self.get_logger().error(f"Error checking binding for {material_box_id}: {str(e)}")
+            return False
+        finally:
+            if self.mutex.locked():
+                self.mutex.release()
+    
+    # TODO: find the highest priority order request
+    def bind_mtrl_box(self, material_box_id: int) -> bool:
+        """
+        Bind a material box to an available order.
+        
+        Args:
+            material_box_id: Integer ID of the material box to bind
+            
+        Returns:
+            bool: True if binding successful, False otherwise
+            
+        Raises:
+            TypeError: If material_box_id is not an integer
+            ValueError: If material_box_id is negative
+        """
+        if not isinstance(material_box_id, int):
+            raise TypeError(f"Expected integer id, got {type(material_box_id).__name__}")
+        if material_box_id < 0:
+            raise ValueError(f"Material box ID must be non-negative, got {material_box_id}")
+        
+        try:
+            acquired = self.mutex.acquire(timeout=1.0)  # 1 second timeout
+            if not acquired:
+                self.get_logger().error("Failed to acquire lock for material box binding")
+                return False
+            for order_id, status in self.mtrl_box_status.items():
                 if status.id == 0:
+                    new_status = deepcopy(status)
                     new_status.id = material_box_id
                     new_status.status = MaterialBoxStatus.STATUS_CLEANING
                     self.mtrl_box_status[order_id] = new_status
-                    self.get_logger().info(f"Material box [{material_box_id}] has binded to order [{order_id}]")
+                    self.get_logger().info(f"Material box [{material_box_id}] has been bound to order [{order_id}]")
                     return True
 
-        self.get_logger().info("No available material box found for binding")
-        return False
+            self.get_logger().info("No available material box found for binding")
+            return False
+        except Exception as e:
+            self.get_logger().error(f"Error in bind_mtrl_box: {str(e)}")
+            return False
+            
+        finally:
+            if self.mutex.locked():
+                self.mutex.release()
 
     def get_curr_gone(self, mtrl_box: MaterialBox) -> set:
         curr_gone = set()
@@ -669,18 +912,68 @@ class Manager(Node):
         self.conveyor.append(11) # Packaging Machine 2
         self.get_logger().info(f"\n{self.conveyor}")
 
-    def get_order_id_by_mtrl_box(self, mtrl_box_id: int) -> int:
-        with self.mutex:
-            for status in self.mtrl_box_status.values():
+    def get_order_id_by_mtrl_box(self, mtrl_box_id: int) -> Optional[int]:
+        """
+        Get the order ID associated with a material box ID.
+        
+        Args:
+            mtrl_box_id: The material box ID to look up
+            
+        Returns:
+            Optional[int]: The associated order ID if found, None if not found
+            
+        Raises:
+            TypeError: If mtrl_box_id is not an integer
+            ValueError: If mtrl_box_id is negative
+        """
+        if not isinstance(mtrl_box_id, int):
+            raise TypeError(f"Expected integer id, got {type(mtrl_box_id).__name__}")
+        if mtrl_box_id < 0:
+            raise ValueError(f"Material box ID must be non-negative, got {mtrl_box_id}")
+        
+        try:
+            acquired = self.mutex.acquire(timeout=1.0)  # 5 second timeout
+            if not acquired:
+                self.get_logger().error(f"Failed to acquire lock for mtrl_box_id {mtrl_box_id}")
+                return None
+
+            for order_id, status in self.mtrl_box_status.items():
                 if mtrl_box_id == status.id:
-                    return status.order_id
-        return 0
+                    self.get_logger().debug(f"Found order {order_id} for material box {mtrl_box_id}")
+                    return order_id
+
+            self.get_logger().debug(f"No order found for material box {mtrl_box_id}")
+            return None
+        except Exception as e:
+            self.get_logger().error(f"Error getting order for mtrl_box_id {mtrl_box_id}: {str(e)}")
+            return None
+        finally:
+            if self.mutex.locked():
+                self.mutex.release()
 
     def get_dis_station_cli(self, station_id: int) -> Optional[rclpy.client.Client]:
         """Safely get a dispenser station client by ID."""
         return self.dis_station_clis.get(station_id)
 
     async def send_income_mtrl_box(self, mtrl_box_id: int) -> None:
+        """
+        Asynchronously send a material box ID to the income service.
+        
+        Args:
+            mtrl_box_id: The material box ID to send
+            
+        Returns:
+            bool: True if successfully sent, False otherwise
+            
+        Raises:
+            TypeError: If mtrl_box_id is not an integer
+            ValueError: If mtrl_box_id is negative
+        """
+        if not isinstance(mtrl_box_id, int):
+            raise TypeError(f"Expected integer mtrl_box_id, got {type(mtrl_box_id).__name__}")
+        if mtrl_box_id < 0:
+            raise ValueError(f"Material box ID must be non-negative, got {mtrl_box_id}")
+        
         req = UInt8.Request()
         req.data = mtrl_box_id
 
@@ -691,19 +984,46 @@ class Manager(Node):
 
         try:
             future = self.income_mtrl_box_cli.call_async(req)
-            await future
-            res = future.result()
+            # await future
+            # res = future.result()
+            res = await asyncio.wait_for(future, timeout=1.0)
+
             if res.success:
-                self.get_logger().info(f"income_mtrl_box id: {mtrl_box_id}")
+                self.get_logger().info(f"Successfully sent material box ID: {mtrl_box_id}")
                 return True
-            else:
-                self.get_logger().error("Failed to send income_mtrl_box")
-                return False
+        
+            self.get_logger().error(f"Service call succeeded but reported failure for ID: {mtrl_box_id}")
+            return False
+        except asyncio.TimeoutError:
+            self.get_logger().error(f"Service call timeout for material box ID: {mtrl_box_id}")
+            return False
+        except AttributeError as e:
+            self.get_logger().error(f"Invalid service response for ID {mtrl_box_id}: {str(e)}")
+            return False
         except Exception as e:
-            self.get_logger().error(f"Error writing registers: {e}")
+            self.get_logger().error(f"Service call failed for ID {mtrl_box_id}: {str(e)}")
             return False
 
-    async def read_registers(self, address: int, count: int) -> List[int]:
+    async def read_registers(self, address: int, count: int) -> Optional[List[int]]:
+        """
+        Asynchronously read a specified number of registers from a given address.
+        
+        Args:
+            address: Starting register address to read from
+            count: Number of registers to read
+            
+        Returns:
+            Optional[List[int]]: List of register values if successful, None if failed
+            
+        Raises:
+            TypeError: If address or count are not integers
+            ValueError: If address or count are negative
+        """
+        if not isinstance(address, int) or not isinstance(count, int):
+            raise TypeError(f"Expected integers, got address: {type(address).__name__}, count: {type(count).__name__}")
+        if address < 0 or count < 0:
+            raise ValueError(f"Address ({address}) and count ({count}) must be non-negative")
+        
         req = ReadRegister.Request()
         req.address = address
         req.count = count
@@ -715,19 +1035,53 @@ class Manager(Node):
 
         try:
             future = self.read_cli.call_async(req)
-            await future
-            res = future.result()
+            # await future
+            # res = future.result()
+            res = await asyncio.wait_for(future, timeout=1.0)
             if res.success:
-                self.get_logger().info(f"Read registers: {address}, count: {count}")
+                if not isinstance(res.values, list):
+                    self.get_logger().error("Invalid response format: values not a list")
+                    return None
+                self.get_logger().info(f"Successfully read {len(res.values)} registers from address {address}")
                 return res.values
-            else:
-                self.get_logger().error("Failed to read registers")
-                return None
+            
+            self.get_logger().error(f"Service reported failure reading registers at {address}")
+            return None
+
+        except asyncio.TimeoutError:
+            self.get_logger().error(f"Timeout reading registers at address {address}")
+            return None
+        except AttributeError as e:
+            self.get_logger().error(f"Invalid response format for address {address}: {str(e)}")
+            return None
         except Exception as e:
-            self.get_logger().error(f"Error reading registers: {e}")
+            self.get_logger().error(f"Failed to read registers at {address}: {str(e)}")
             return None
   
-    async def write_registers(self, address: int, values: List[int]) -> None:
+    async def write_registers(self, address: int, values: List[int]) -> bool:
+        """
+        Asynchronously write values to registers starting at the specified address.
+        
+        Args:
+            address: Starting register address to write to
+            values: List of integer values to write
+            
+        Returns:
+            bool: True if write successful, False otherwise
+            
+        Raises:
+            TypeError: If address or values have incorrect types
+            ValueError: If address is negative or values list is empty
+        """
+        if not isinstance(address, int):
+            raise TypeError(f"Expected integer address, got {type(address).__name__}")
+        if not isinstance(values, list) or not all(isinstance(v, int) for v in values):
+            raise TypeError(f"Expected list of integers for values, got {type(values).__name__}")
+        if address < 0:
+            raise ValueError(f"Address must be non-negative, got {address}")
+        if not values:
+            raise ValueError("Values list cannot be empty")
+        
         req = WriteRegister.Request()
         req.address = address
         req.values = values
@@ -739,16 +1093,23 @@ class Manager(Node):
 
         try:
             future = self.write_cli.call_async(req)
-            await future
-            res = future.result()
+            # await future
+            # res = future.result()
+            res = await asyncio.wait_for(future, timeout=1.0) 
             if res.success:
-                self.get_logger().info(f"write registers: {address}, values: {values}")
+                self.get_logger().info(f"Successfully wrote {len(values)} registers at address {address}: {values}")
                 return True
-            else:
-                self.get_logger().error("Failed to write registers")
-                return False
+                
+            self.get_logger().error(f"Service reported failure writing {len(values)} registers at {address}")
+            return False
+        except asyncio.TimeoutError:
+            self.get_logger().error(f"Timeout writing registers at address {address}")
+            return False
+        except AttributeError as e:
+            self.get_logger().error(f"Invalid response format for address {address}: {str(e)}")
+            return False
         except Exception as e:
-            self.get_logger().error(f"Error writing registers: {e}")
+            self.get_logger().error(f"Failed to write registers at {address}: {str(e)}")
             return False
     
     def run_loop(self):
