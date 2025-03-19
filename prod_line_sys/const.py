@@ -8,7 +8,7 @@ class Const:
         self.NUM_DISPENSER_STATIONS: Final[int] = 14
 
         self.MOVEMENT_ADDR: Final[int] = 5000
-        self.CANMERA_STATION_PLC_MAP: Final[Dict] = {
+        self.CAMERA_STATION_PLC_MAP: Final[Dict] = {
             1: ([1, 2],   5201),
             2: ([3, 4],   5202),
             3: ([5, 6],   5203),
