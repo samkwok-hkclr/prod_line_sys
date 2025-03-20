@@ -5,6 +5,9 @@ class Const:
     def __init__(self):
         self.GO_STRAIGHT: Final[int] = 0
         
+        self.CELLS: Final[int] = 28
+        self.EXIT_STATION: Final[int] = 29
+        
         self.NUM_DISPENSER_STATIONS: Final[int] = 14
 
         self.MOVEMENT_ADDR: Final[int] = 5000
