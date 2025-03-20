@@ -30,7 +30,7 @@ def main(args=None):
     mtrl_box = MaterialBox()
 
     location = DrugLocation()
-    location.dispenser_station = random.randrange(3, 14)
+    location.dispenser_station = 1
     location.dispenser_unit = 5
 
     drug_1 = Drug()
@@ -39,9 +39,9 @@ def main(args=None):
     drug_1.locations.append(location)
 
     mtrl_box.slots[0].drugs.append(drug_1)
-    
+    mtrl_box.slots[24].drugs.append(drug_1)
     random.seed()
-    req.order_id = int(random.random()*10000000000)
+    req.order_id = int(random.random()*1000000)
 
     req.material_box = mtrl_box
     response = fake_new_order.send_request(req)
