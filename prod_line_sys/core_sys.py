@@ -1,7 +1,7 @@
 import sys
 import time
 import asyncio
-from asyncio import coroutine, run_coroutine_threadsafe
+from asyncio import coroutine, run, run_coroutine_threadsafe
 from collections import deque
 from threading import Thread, Lock
 from typing import Dict, List, Set, Tuple, Final, Optional
@@ -134,7 +134,7 @@ class CoreSystem(Node):
         self.rel_blocking_cli = self.create_client(Trigger, "release_blocking", callback_group=srv_cli_cbg)
         self.pkg_order_cli = self.create_client(PackagingOrder, "packaging_order", callback_group=srv_cli_cbg)
         self.dis_station_clis: Dict[int, rclpy.client.Client] = {} # station_id, Client
-        self._initialize_dis_station_clis(station_srv_cli_cbgs)
+        self._initialize_dis_station_clis(srv_cli_cbg)
         self.get_logger().info("Service Clients are created")
 
         # Action server
@@ -150,7 +150,7 @@ class CoreSystem(Node):
         )
 
         # Timers
-        self.qr_handle_timer = self.create_timer(2.0, self.qr_handle_cb, callback_group=qr_handle_timer_cbg)
+        self.qr_handle_timer = self.create_timer(1.0, self.qr_handle_cb, callback_group=qr_handle_timer_cbg)
         self.start_order_timer = self.create_timer(1.0, self.start_order_cb, callback_group=normal_timer_cbg)
         self.order_status_timer = self.create_timer(1.0, self.order_status_cb, callback_group=normal_timer_cbg)
         self.elevator_timer = self.create_timer(1.0, self.elevator_dequeue_cb, callback_group=normal_timer_cbg)
@@ -358,7 +358,7 @@ class CoreSystem(Node):
             self.pkg_mac_status[machine_id] = msg
 
     # Timers callback
-    def start_order_cb(self) -> None:
+    async def start_order_cb(self) -> None:
         with self.mutex:
             if len(self.recv_order) == 0 or not self.is_plc_connected or self.is_releasing_mtrl_box:
                 return
@@ -378,7 +378,7 @@ class CoreSystem(Node):
         else:
             self.get_logger().error("Failed to call the PLC to release a material box")
     
-    def order_status_cb(self) -> None:
+    async def order_status_cb(self) -> None:
         """
         update and publish material box status messages.
         """
@@ -398,9 +398,18 @@ class CoreSystem(Node):
                 self.mutex.release()
         
         values = self.read_registers(5030, 1)
-        self.get_logger().error(f"values: {values[0]}")
+        self.get_logger().error(f"values: {values[0]}  {self.get_clock().now()}")
 
-    def elevator_dequeue_cb(self) -> None:
+        success = self.write_registers(5014, [2])
+        self.get_logger().error(f"success: {self.get_clock().now()}")
+
+        # req = DispenseDrug.Request()
+        # req.content.append(DispenseContent(unit_id=5, amount=1))
+        # self.get_logger().error(f"req: {req}")
+        # success = self.send_dispense_req(req, 1)
+        # self.get_logger().error(f"success: {success}")
+
+    async def elevator_dequeue_cb(self) -> None:
         if self.is_releasing_mtrl_box or len(self.elevator_queue) == 0:
             return
         
@@ -411,8 +420,8 @@ class CoreSystem(Node):
         
         req = Trigger.Request()
         try:
-            future = self.rel_blocking_cli.call_async(req)
-            self.exec.spin_until_future_complete(future, timeout_sec=1.0)
+            future = await self.rel_blocking_cli.call_async(req)
+            self.exec.spin_once_until_future_complete(future, timeout_sec=1.0)
             res = future.result()
 
             if res and res.success:
@@ -425,7 +434,7 @@ class CoreSystem(Node):
         except Exception as e:
             self.get_logger().error(f"Error writing registers: {e}")
 
-    def qr_handle_cb(self) -> None:
+    async def qr_handle_cb(self) -> None:
         if len(self.qr_scan) == 0:
             return
     
@@ -448,15 +457,15 @@ class CoreSystem(Node):
                     order_id = self.get_order_id_by_mtrl_box(material_box_id)
                     if camera_1_result:
                         continue
-                    is_completed = self.camera_1_to_9_action(order_id, material_box_id, camera_id) 
+                    is_completed = await self.camera_1_to_9_action(order_id, material_box_id, camera_id) 
                 case 2 | 3 | 4 | 5 | 6 | 7 | 8: # QR scanner           
-                    is_completed = self.camera_1_to_9_action(order_id, material_box_id, camera_id) 
+                    is_completed = await self.camera_1_to_9_action(order_id, material_box_id, camera_id) 
                 case 9: # vision inspection
-                    is_completed = self.camera_9_action(order_id, material_box_id)  
+                    is_completed = await self.camera_9_action(order_id, material_box_id)  
                 case 10: # packaging machine 1
-                    is_completed = self.camera_10_action(order_id, material_box_id)      
+                    is_completed = await self.camera_10_action(order_id, material_box_id)      
                 case 11: # packaging machine 2
-                    is_completed = self.camera_11_action(order_id, material_box_id)      
+                    is_completed = await self.camera_11_action(order_id, material_box_id)      
                 case _:
                     self.get_logger().info(f"Received unknown camera ID: {camera_id}")
                    
@@ -508,17 +517,10 @@ class CoreSystem(Node):
 
         self.get_logger().error(f"target_cell: {target_cell}")
 
-        future = None
         if target_cell == self.const.EXIT_STATION:
             success = self.move_out_station(station, station_id, mtrl_box_id)
         elif curr_sliding_platform == cmd_sliding_platform:
             success = self.dispense_action(station, station_id, status, order, target_cell)
-        # else:
-        #     if cmd_sliding_platform != curr_sliding_platform:
-        #         address = self.const.MOVEMENT_ADDR + station_id
-        #         success = self.write_registers(address, [target_cell + 1])
-        #         with self.mutex:
-        #             station.cmd_sliding_platform = target_cell + 1
 
 
     # Service Server callback
@@ -557,7 +559,7 @@ class CoreSystem(Node):
         self.get_logger().debug(f"Successfully processed order {order_id}")
         return res
     
-    def move_sliding_platform_cb(self, req, res):
+    async def move_sliding_platform_cb(self, req, res):
         """
         Move the sliding platform to a specified cell for a dispense station.
         
@@ -807,15 +809,18 @@ class CoreSystem(Node):
 
             return req_to_go - curr_gone 
 
-    def _initialize_dis_station_clis(self, cbgs: List[MutuallyExclusiveCallbackGroup]) -> None:
+    # def _initialize_dis_station_clis(self, cbgs: List[MutuallyExclusiveCallbackGroup]) -> None:
+    def _initialize_dis_station_clis(self, cbg) -> None:
         """Initialize dispenser stations service clients."""
         for i in range(1, self.const.NUM_DISPENSER_STATIONS + 1):
+            # cbg_index = int(i - 1)
             self.dis_station_clis[i] = self.create_client(
                 DispenseDrug, 
                 f"/dispenser_station_{i}/dispense_request",
-                callback_group=cbgs[i - 1]
+                callback_group=cbg
             )
-            self.get_logger().debug(f"Dispenser station [{i}] service client is created")
+            # self.get_logger().info(f"Dispenser station [{i}] service client is created w/ {cbgs[cbg_index]}")
+            self.get_logger().info(f"Dispenser station [{i}] service client is created")
 
     def _initialize_dis_station_timers(self, period: float, cbgs: List[MutuallyExclusiveCallbackGroup]) -> None:
         """Initialize dispenser stations timers."""
@@ -823,10 +828,14 @@ class CoreSystem(Node):
             cbg_index = int(i - 1)
             self.dis_station_timers[i] = self.create_timer(
                 period,
+                # lambda station_id=i: run_coroutine_threadsafe(
+                #     self.station_decision_cb(station_id), 
+                #     self.loop
+                # ).result(),
                 lambda station_id=i: self.station_decision_cb(station_id),
                 callback_group=cbgs[cbg_index]
             )
-            self.get_logger().debug(f"Dispenser station [{i}] execution timer is created")
+            self.get_logger().info(f"Dispenser station [{i}] execution timer is created")
 
     def _initialize_conveyor(self) -> None:
         """Initialize Conveyor Structure."""
@@ -931,16 +940,17 @@ class CoreSystem(Node):
             success = self.write_registers(self.const.MOVEMENT_ADDR + station_id, [self.const.EXIT_STATION])
             if success:
                 try:
-                    acquired = self.mutex.acquire(timeout=1.0)
+                    acquired = self.mutex.acquire(timeout=3.0)
                     if not acquired:
                         self.get_logger().error(f"Failed to acquire lock for occupancy update")
                         return False
-
+                    
                     conveyor.is_occupied = True
                     conveyor.curr_mtrl_box = mtrl_box_id
                     station.is_occupied = False
                     station.curr_mtrl_box = 0
                     station.is_completed = [False] * self.const.CELLS
+                    station.is_dispense_req_sent = [False] * self.const.CELLS
                     return True
                 finally:
                     if self.mutex.locked():
@@ -989,29 +999,33 @@ class CoreSystem(Node):
             cell_order_mtrl_box = order.material_box.slots[target_cell]
 
             # Find required drugs
-            required: Set[List[Tuple[int, int, int]]] = set()
+            required: Set[Tuple[Tuple[int, int, int], ...]] = set()
             for drug in cell_order_mtrl_box.drugs:
-                locations = [(loc.dispenser_station, loc.dispenser_unit, drug.amount) for loc in drug.locations]
+                locations = tuple((loc.dispenser_station, loc.dispenser_unit, drug.amount) for loc in drug.locations)
                 required.add(locations)
                     
             # Find current drugs
-            curr: Set[Tuple[int, int, int]] = set()
+            curr: Set[Tuple[int, int, int], ...] = set()
             for drug in cell_curr_mtrl_box.dispensing_detail:
                 curr.add((drug.location.dispenser_station, drug.location.dispenser_unit, drug.amount))
-            self.get_logger().debug(f"required: {required}")
-            self.get_logger().debug(f"curr: {curr}")
+            self.get_logger().warning(f"required: {required}")
+            self.get_logger().warning(f"curr: {curr}")
 
             missing_sets = [req_set for req_set in required if req_set not in curr]
             missing_lists = [list(req_set) for req_set in missing_sets]
-            self.get_logger().debug(f"missing_sets: {missing_sets}")
-            self.get_logger().debug(f"missing_lists: {missing_lists}")
+
+            self.get_logger().warning(f"missing_sets: {missing_sets}")
+            self.get_logger().warning(f"missing_lists: {missing_lists}")
 
             filtered_missing = [
                 [item for item in lst if item[0] == station_id]
                 for lst in missing_lists
-                if any(item[0] == station_id for item in lst)  # Skip lists with no matching station_id
+                if any(item[0] == station_id for item in lst) 
             ]
             self.get_logger().debug(f"filtered_missing: {filtered_missing}")
+
+            if filtered_missing:
+                filtered_missing = filtered_missing[0]
 
             if filtered_missing:
                 self.get_logger().error(f"target_cell: {target_cell} has missing drugs: {filtered_missing}")
@@ -1022,6 +1036,10 @@ class CoreSystem(Node):
                 self.get_logger().info(f"Set target_cell: {target_cell} to True")
                 self.get_logger().error(f"target_cell: {target_cell} is complete")
                 target_cell += 1
+
+        if target_cell >= self.const.CELLS:
+            self.get_logger().error(f"The station is completed.")
+            return False
         
         self.get_logger().error(f"station.cmd: {station.cmd_sliding_platform}")
         self.get_logger().error(f"station.curr: {station.curr_sliding_platform}")
@@ -1036,25 +1054,28 @@ class CoreSystem(Node):
             self.get_logger().error(f"THe station {[station_id]} movement does not ready")
             return False
 
-        self.get_logger().error(f"Try to send the dispense request")
-        req = DispenseDrug.Request()
-        for unit_id, amount in filtered_missing:
-            req.content.append(DispenseContent(unit_id=unit_id, amount=amount))
+        if station.is_dispense_req_sent[target_cell]:
+            self.get_logger().error(f"THe station {[station_id]} dispense request sent!")
+            return False
 
-        self.get_logger().error(f"Wait the service ready")
-        while not self.dis_station_clis[station_id].wait_for_service(timeout_sec=1.0):
-            if not rclpy.ok():
-                break
-            self.get_logger().info("Dispense Service not available, waiting again...")
+        self.get_logger().error(f"Try to send the dispense request")
+
+        req = DispenseDrug.Request()
+        for item in filtered_missing:
+            req.content.append(DispenseContent(unit_id=item[0], amount=item[1]))
+        self.get_logger().error(f"req: {req}")
 
         try:
             self.get_logger().error(f"start to send")
-            future = self.dis_station_clis[station_id].call_async(req) #######
-            self.exec.spin_until_future_complete(future, timeout_sec=1.0)
-            res = future.result()
+
+            with self.mutex:
+                station.is_dispense_req_sent[target_cell] = True
+            values = self.read_registers(5030, 1)
+            success = self.send_dispense_req(req, station_id)
+            self.get_logger().error(f"values: {values[0]}  {self.get_clock().now()}")
             self.get_logger().info("Called the Dispense service")
-            if res and res.success:
-                self.dispense_wait.sleep()
+
+            if success:
                 with self.mutex:
                     station.is_completed[target_cell] = True
                     self.get_logger().info(f"Set target_cell: {target_cell} to True")
@@ -1100,7 +1121,7 @@ class CoreSystem(Node):
 
         return is_continue
     
-    def camera_1_to_9_action(self, order_id: int, material_box_id: int, camera_id: int) -> Optional[bool]:
+    async def camera_1_to_9_action(self, order_id: int, material_box_id: int, camera_id: int) -> Optional[bool]:
         """
         Process operations for camera 1 to 9 for a given order and material box.
         
@@ -1189,13 +1210,13 @@ class CoreSystem(Node):
         self.get_logger().warning(f"decision [{decision}] / {station_ids} is made for material box [{material_box_id}] in camera [{camera_id}]")
         return is_completed
     
-    def camera_9_action(self, order_id: int, material_box_id: int) -> Optional[bool]:
+    async def camera_9_action(self, order_id: int, material_box_id: int) -> Optional[bool]:
         is_completed = True
 
         self.get_logger().info(f"Vision inspection triggered for material box [{material_box_id}]")
         return is_completed
         
-    def camera_10_action(self, order_id: int, material_box_id: int) -> Optional[bool]:
+    async def camera_10_action(self, order_id: int, material_box_id: int) -> Optional[bool]:
         """
         Process operations for camera 10 for a given order and material box.
         
@@ -1210,7 +1231,7 @@ class CoreSystem(Node):
 
         remainder = self.find_remainder(order_id)
         if len(remainder) == 0 and self.get_any_pkc_mac_is_idle():
-            pkg_req_success = self.send_pkg_req(order_id)
+            pkg_req_success = await self.send_pkg_req(order_id)
             if pkg_req_success:
                 self.get_logger().warning(f"Sent a packaging request to packaging machine manager successfully")
                 self.proc_order.pop(order_id)
@@ -1219,7 +1240,7 @@ class CoreSystem(Node):
             else:
                 self.get_logger().error(f"Failed to send the packaging request to packaging machine manager") 
         else:
-            block_success = self.send_income_mtrl_box(material_box_id)
+            block_success = await self.send_income_mtrl_box(material_box_id)
             if block_success:
                 self.get_logger().warning(f"Sent a income materail box to packaging machine manager successfully")
             else:
@@ -1242,7 +1263,7 @@ class CoreSystem(Node):
         self.get_logger().info(f"Packaging machine 1 triggered for material box [{material_box_id}]")    
         return is_completed
     
-    def camera_11_action(self, order_id: int, material_box_id: int) -> Optional[bool]:
+    async def camera_11_action(self, order_id: int, material_box_id: int) -> Optional[bool]:
         """
         Process operations for camera 11 for a given order and material box.
         
@@ -1267,13 +1288,13 @@ class CoreSystem(Node):
             else:
                 self.get_logger().error(f"Failed to write to register for elevator")
         
-        success = self.send_con_mtrl_box(material_box_id)
+        success = await self.send_con_mtrl_box(material_box_id)
         is_completed = success and elevator_success
 
         self.get_logger().info(f"Packaging machine 2 triggered for material box [{material_box_id}]")
         return is_completed
 
-    def send_income_mtrl_box(self, mtrl_box_id: int) -> Optional[bool]:
+    async def send_income_mtrl_box(self, mtrl_box_id: int) -> Optional[bool]:
         """
         Send a material box ID to the income service.
         
@@ -1301,9 +1322,10 @@ class CoreSystem(Node):
             self.get_logger().info("income_mtrl_box Service not available, waiting again...")
 
         try:
-            future = self.income_mtrl_box_cli.call_async(req)
-            self.exec.spin_until_future_complete(future, timeout_sec=1.0)
-            res = future.result()
+            res = await self.income_mtrl_box_cli.call_async(req)
+            # future = self.income_mtrl_box_cli.call_async(req)
+            # self.exec.spin_once_until_future_complete(future, timeout_sec=1.0)
+            # res = future.result()
   
             if res and res.success:
                 self.get_logger().info(f"Successfully sent material box ID: {mtrl_box_id}")
@@ -1319,7 +1341,7 @@ class CoreSystem(Node):
             self.get_logger().error(f"Service call failed for ID {mtrl_box_id}: {str(e)}")
             return False
 
-    def send_pkg_req(self, order_id) -> Optional[bool]:
+    async def send_pkg_req(self, order_id) -> Optional[bool]:
         """
         Send a packaging request for a specific order.
         
@@ -1389,9 +1411,10 @@ class CoreSystem(Node):
             self.get_logger().info("packaging_order Service not available, waiting again...")
 
         try:
-            future = self.pkg_order_cli.call_async(req)
-            self.exec.spin_until_future_complete(future, timeout_sec=1.0)
-            res = future.result()
+            res = await self.pkg_order_cli.call_async(req)
+            # future = self.pkg_order_cli.call_async(req)
+            # self.exec.spin_once_until_future_complete(future, timeout_sec=1.0)
+            # res = future.result()
   
             if res and res.success:
                 self.get_logger().info(f"Packaging request successful for order {order_id}")
@@ -1409,7 +1432,7 @@ class CoreSystem(Node):
             self.get_logger().error(f"Service call failed for order id {order_id}: {str(e)}")
             return False
 
-    def send_con_mtrl_box(self, mtrl_box_id: int) -> Optional[bool]:
+    async def send_con_mtrl_box(self, mtrl_box_id: int) -> Optional[bool]:
         """
         Send a material box ID to the container service.
         
@@ -1437,9 +1460,10 @@ class CoreSystem(Node):
             self.get_logger().info("container_material_box Service not available, waiting again...")
 
         try:
-            future = self.con_mtrl_box_cli.call_async(req)
-            self.exec.spin_until_future_complete(future, timeout_sec=1.0)
-            res = future.result()
+            res = await self.con_mtrl_box_cli.call_async(req)
+            # future = self.con_mtrl_box_cli.call_async(req)
+            # self.exec.spin_once_until_future_complete(future, timeout_sec=1.0)
+            # res = future.result()
   
             if res and res.success:
                 self.get_logger().info(f"Successfully sent material box ID: {mtrl_box_id}")
@@ -1455,6 +1479,38 @@ class CoreSystem(Node):
             self.get_logger().error(f"Service call failed for ID {mtrl_box_id}: {str(e)}")
             return False
 
+    def send_dispense_req(self, req: DispenseDrug.Request, station_id: int) -> Optional[bool]:
+        self.get_logger().info("dis_station_clis start")
+        if not isinstance(req, DispenseDrug.Request):
+            raise TypeError(f"Expected DispenseDrug.Request(), got {type(req).__name__}")
+
+        while not self.get_dis_station_cli(station_id).wait_for_service(timeout_sec=1.0):
+            if not rclpy.ok():
+                return None
+            self.get_logger().info("container_material_box Service not available, waiting again...")
+
+        try:
+            self.get_logger().info("dis_station_clis call")
+            future = self.get_dis_station_cli(station_id).call_async(req)
+            self.exec.spin_until_future_complete(future)
+            res = future.result()
+            self.get_logger().info("dis_station_clis called")
+  
+            if res and res.success:
+                self.get_logger().info(f"Successfully sent dispenser station: {station_id}")
+                return True
+        
+            self.get_logger().error(f"Service call succeeded but reported failure for dispenser station: {station_id}")
+            return False
+
+        except AttributeError as e:
+            self.get_logger().error(f"Invalid service response {station_id}: {str(e)}")
+            return False
+        except Exception as e:
+            self.get_logger().error(f"Service call failed {station_id}: {str(e)}")
+            return False
+
+    # async def read_registers(self, address: int, count: int) -> Optional[array]:
     def read_registers(self, address: int, count: int) -> Optional[array]:
         """
         Read a specified number of registers from a given address.
@@ -1485,6 +1541,7 @@ class CoreSystem(Node):
             self.get_logger().info("read_registers Service not available, waiting again...")
 
         try:
+            # res = await self.read_cli.call_async(req)
             future = self.read_cli.call_async(req)
             self.exec.spin_until_future_complete(future, timeout_sec=1.0)
             res = future.result()
@@ -1541,6 +1598,7 @@ class CoreSystem(Node):
             self.get_logger().info("write_registers Service not available, waiting again...")
 
         try:
+            # res = await self.write_cli.call_async(req)
             future = self.write_cli.call_async(req)
             self.exec.spin_until_future_complete(future, timeout_sec=1.0)
             res = future.result() 

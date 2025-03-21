@@ -7,6 +7,7 @@ class DispenserStation:
         self.curr_sliding_platform: int = 0
         self.cmd_sliding_platform: int = 0
         self.is_completed: List[bool] = [False] * 28
+        self.is_dispense_req_sent: List[bool] = [False] * 28
         self.is_platform_ready: bool = False
         self.is_occupied: bool = False
 
