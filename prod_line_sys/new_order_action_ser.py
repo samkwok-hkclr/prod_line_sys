@@ -207,15 +207,15 @@ class NewOrderActionServer(Node):
 
                 with self._status_lock:
                     sent_tuple = self.order_sent.get(order_id)
-                    if sent_tuple[0]:
+                    if sent_tuple and sent_tuple[0]:
                         status_tuple = self.mtrl_box_status.get(order_id)
                         if status_tuple is None:
                             self.get_logger().error(f"Status for order_id {order_id} does not publish yet")
-
-                        if status_tuple[0].id != 0:
-                            result.response.material_box_id = status_tuple[0].id
-                            result.response.success = True
-                            break
+                        else:
+                            if status_tuple[0].id != 0:
+                                result.response.material_box_id = status_tuple[0].id
+                                result.response.success = True
+                                break
 
                 self.get_logger().warning(f"Waiting for material box ID for order_id={order_id} ({retries} retries)...")
                 goal_handle.publish_feedback(feedback_msg)
@@ -227,6 +227,7 @@ class NewOrderActionServer(Node):
                 result.response.message = "Material box assignment timed out"
                 self.get_logger().error(f"Timeout after {retries} retries for order_id={order_id}")
 
+            self.get_logger().warning(f"Oh yeah! The action are handled order_id={order_id}).")
             goal_handle.succeed()
             return result
         

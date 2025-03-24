@@ -26,20 +26,34 @@ def main(args=None):
 
     fake_new_order = FakeNewOrder()
     req = OrderRequest()
+    req.patient.name = "Sam Kwok"
+    req.patient.institute_name = "HKCLR"
 
     mtrl_box = MaterialBox()
 
-    location = DrugLocation()
-    location.dispenser_station = 1
-    location.dispenser_unit = 5
+    location_1 = DrugLocation()
+    location_1.dispenser_station = 1
+    location_1.dispenser_unit = 5
+
+    location_2 = DrugLocation()
+    location_2.dispenser_station = 5
+    location_2.dispenser_unit = 8
 
     drug_1 = Drug()
     drug_1.drug_id = "123"
     drug_1.amount = 1
-    drug_1.locations.append(location)
+    drug_1.locations.append(location_1)
+
+    drug_2 = Drug()
+    drug_2.drug_id = "123"
+    drug_2.amount = 1
+    drug_2.locations.append(location_2)
+
 
     mtrl_box.slots[0].drugs.append(drug_1)
     mtrl_box.slots[24].drugs.append(drug_1)
+    mtrl_box.slots[4].drugs.append(drug_2)
+    mtrl_box.slots[24].drugs.append(drug_2)
     random.seed()
     req.order_id = int(random.random()*1000000)
 

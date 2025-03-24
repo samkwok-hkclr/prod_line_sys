@@ -3,7 +3,7 @@ import time
 import asyncio
 from asyncio import coroutine, run, run_coroutine_threadsafe
 from collections import deque
-from threading import Thread, Lock
+from threading import Thread, Lock, Condition
 from typing import Dict, List, Set, Tuple, Optional
 from array import array
 from copy import deepcopy
@@ -55,7 +55,7 @@ class CoreSystem(Node):
         self.recv_order = deque()
         self.proc_order: Dict[int, OrderRequest] = {} # order_id, OrderRequest
         self.mtrl_box_status: Dict[int, MaterialBoxStatus] = {} # order_id, MaterialBoxStatus
-        self.qr_scan: List[CameraTrigger] = [] 
+        self.qr_scan: List[CameraTrigger] = []
         self.elevator_queue = deque()
 
         self.pkg_mac_status: Dict[int, PackagingMachineStatus] = {} # pkg_mac_id, PackagingMachineStatus
@@ -68,6 +68,7 @@ class CoreSystem(Node):
 
         # mutex
         self.mutex = Lock()
+        self.qr_scan_mutex = Lock()
 
         # Graph of conveyor structure
         self.conveyor = None
@@ -140,7 +141,7 @@ class CoreSystem(Node):
         self.get_logger().info("Service Clients are created")
 
         # Timers
-        self.qr_handle_timer = self.create_timer(1.0, self.qr_handle_cb, callback_group=qr_handle_timer_cbg)
+        self.qr_handle_timer = self.create_timer(2.0, self.qr_handle_cb, callback_group=qr_handle_timer_cbg)
         self.start_order_timer = self.create_timer(1.0, self.start_order_cb, callback_group=normal_timer_cbg)
         self.order_status_timer = self.create_timer(1.0, self.order_status_cb, callback_group=normal_timer_cbg)
         self.elevator_timer = self.create_timer(1.0, self.elevator_dequeue_cb, callback_group=normal_timer_cbg)
@@ -181,7 +182,7 @@ class CoreSystem(Node):
         self.get_logger().debug(f"Material box release state: {new_state}{' (conveyor marked occupied)' if new_state else ''}")
         
         if new_state != prev_state:
-            self.get_logger().info(f"Release state changed: {prev_state} -> {new_state}")
+            self.get_logger().warning(f"Release state changed: {prev_state} -> {new_state}")
 
     def sliding_platform_curr_cb(self, msg: UInt8MultiArray) -> None:
         """
@@ -316,9 +317,10 @@ class CoreSystem(Node):
             self.get_logger().error(f"Received undefined material_box_id: {msg.material_box_id}")
             return
         
-        with self.mutex:
+        with self.qr_scan_mutex:
             if len(self.qr_scan) == 0:
                 self.qr_scan.append(msg)
+                self.get_logger().info(f"Camera {msg.camera_id} box [{msg.material_box_id}] is append to qr_scan [Empty]")
             else:
                 found = False
                 for scan in self.qr_scan:
@@ -330,7 +332,7 @@ class CoreSystem(Node):
                     self.qr_scan.append(msg)
                     self.get_logger().info(f"Camera {msg.camera_id} box [{msg.material_box_id}] is append to qr_scan")
         
-        self.get_logger().info(f"Received CameraTrigger message: camera_id={msg.camera_id}, material_box_id={msg.material_box_id}")
+        self.get_logger().debug(f"Received CameraTrigger message: camera_id={msg.camera_id}, material_box_id={msg.material_box_id}")
 
     def pkg_mac_status_cb(self, msg: PackagingMachineStatus) -> None:
         """
@@ -359,7 +361,8 @@ class CoreSystem(Node):
                 return
         self.get_logger().info("The received queue stored a order")
 
-        success = await self.write_registers(5200, [2])
+        # success = await self.write_registers(5200, [2])
+        success = run_coroutine_threadsafe(self.write_registers(5200, [2]), self.loop).result()
         if success:
             with self.mutex:
                 order = self.recv_order.popleft()
@@ -379,7 +382,7 @@ class CoreSystem(Node):
         """
         curr_time = self.get_clock().now().to_msg()
         try:
-            acquired = self.mutex.acquire(timeout=3.0)
+            acquired = self.mutex.acquire(timeout=1.0)
             if not acquired:
                 self.get_logger().error("Failed to acquire mutex for status update")
                 return
@@ -392,8 +395,8 @@ class CoreSystem(Node):
             if self.mutex.locked():
                 self.mutex.release()
         
-        values = await self.read_registers(5030, 1)
-        self.get_logger().error(f"values: {values[0]}  {self.get_clock().now()}")
+        # values = run_coroutine_threadsafe(self.read_registers(5030, 1), self.loop).result()
+        # self.get_logger().error(f"values: {values[0]}  {self.get_clock().now()}")
 
         # success = await self.write_registers(5014, [2])
         # self.get_logger().error(f"success: {self.get_clock().now()}")
@@ -411,9 +414,11 @@ class CoreSystem(Node):
         self.send_rel_blocking()
 
     async def qr_handle_cb(self) -> None:
-        if len(self.qr_scan) == 0:
-            return
-    
+        with self.qr_scan_mutex:
+            self.get_logger().debug(f"len(self.qr_scan): {len(self.qr_scan)}")
+            if len(self.qr_scan) == 0:
+                return
+        
         self.get_logger().info(f"Started to handle the QR scan, Total: {len(self.qr_scan)}")
         qr_scan_handled = []
 
@@ -427,6 +432,7 @@ class CoreSystem(Node):
             if order_id is None:
                 self.get_logger().info(f"The material box [{material_box_id}] does not bound to any order!")
 
+            self.get_logger().info(f"Start to handle camera: {camera_id}")
             match camera_id:
                 case 1: # QR scanner
                     camera_1_result = self.camera_1_action(order_id, material_box_id)
@@ -434,8 +440,12 @@ class CoreSystem(Node):
                     if camera_1_result:
                         continue
                     is_completed = await self.camera_1_to_9_action(order_id, material_box_id, camera_id) 
-                case 2 | 3 | 4 | 5 | 6 | 7 | 8: # QR scanner           
-                    is_completed = await self.camera_1_to_9_action(order_id, material_box_id, camera_id) 
+                case 2 | 3 | 4 | 5 | 6 | 7 | 8: # QR scanner
+                    if order_id is None:
+                        self.get_logger().info(f"The scan maybe incorrect cameras: {msg.camera_id}, box: {msg.material_box_id} ")
+                        is_completed = True
+                    else:
+                        is_completed = await self.camera_1_to_9_action(order_id, material_box_id, camera_id) 
                 case 9: # vision inspection
                     is_completed = await self.camera_9_action(order_id, material_box_id)  
                 case 10: # packaging machine 1
@@ -444,16 +454,16 @@ class CoreSystem(Node):
                     is_completed = await self.camera_11_action(order_id, material_box_id)      
                 case _:
                     self.get_logger().info(f"Received unknown camera ID: {camera_id}")
-                   
+                
             if is_completed:
                 qr_scan_handled.append(msg)
-        
-        with self.mutex:
+            
+        with self.qr_scan_mutex:
             for msg in qr_scan_handled:
                 self.qr_scan.remove(msg)
                 self.get_logger().info(f"Removed message camera id: {msg.camera_id}, box: {msg.material_box_id} ")
 
-        self.get_logger().debug(f"Completed to handle the QR scan")
+        self.get_logger().info(f"Completed to handle the QR scan")
 
     async def station_decision_cb(self, station_id: int) -> None:
         self.get_logger().debug(f"Dispenser Station [{station_id}] callback is called")
@@ -472,8 +482,6 @@ class CoreSystem(Node):
             self.get_logger().debug(f"Station {station_id} sliding platform is not ready")
             return
 
-        self.get_logger().warning(f"Started to make decision for Station {station_id}")
-
         mtrl_box_id = station.curr_mtrl_box
         order_id = self.get_order_id_by_mtrl_box(mtrl_box_id)
         order = self.proc_order.get(order_id)
@@ -491,18 +499,23 @@ class CoreSystem(Node):
             self.get_logger().error(f"The station {station_id} is completed dispense for the material box {mtrl_box_id}")
             success = await self.move_out_station(station, station_id, mtrl_box_id)
             
-        elif cmd_sliding_platform == 0 or cmd_sliding_platform != curr_sliding_platform:
-            success = await self.write_registers(Const.MOVEMENT_ADDR + station_id, [target_cell + 1])
+        elif cmd_sliding_platform == 0 or \
+             cmd_sliding_platform != curr_sliding_platform or \
+             cmd_sliding_platform != target_cell + 1:
+            self.get_logger().debug(f"station: {station_id} is sending the movement command")
+            # success = await self.write_registers(Const.MOVEMENT_ADDR + station_id, [target_cell + 1])
+            success = run_coroutine_threadsafe(self.write_registers(Const.MOVEMENT_ADDR + station_id, [target_cell + 1]), self.loop).result()
             if success:
-                self.get_logger().error(f"station: {station_id} is moving to {target_cell+1} cell")
+                self.get_logger().info(f"station: {station_id} is moving to {target_cell + 1} cell")
             else:
                 self.get_logger().error(f"write_registers movement failed")
         
         elif station.get_dispense_req_sent(target_cell):
-            self.get_logger().error(f"The station {[station_id]} dispense request are already sent! skip!")
+            self.get_logger().warning(f"The station {[station_id]} dispense request are already sent! skip!")
             
         elif filtered_missing:
-            success = self.dispense_action(station, station_id, filtered_missing, order, target_cell)
+            self.get_logger().info(f"try to dispense")
+            success = self.dispense_action(station, station_id, filtered_missing[0], order, target_cell)
 
         self.get_logger().debug(f"The station {[station_id]} decision are made!!")
 
@@ -574,7 +587,8 @@ class CoreSystem(Node):
         address = Const.MOVEMENT_ADDR + station_id
         values = [cell_no]
 
-        success = await self.write_registers(address, values)
+        # success = await self.write_registers(/address, values)
+        success = run_coroutine_threadsafe(self.write_registers(address, values), self.loop).result()
         res.success = success
 
         if success:
@@ -686,7 +700,7 @@ class CoreSystem(Node):
             return False
         
         try:
-            acquired = self.mutex.acquire(timeout=3.0)
+            acquired = self.mutex.acquire(timeout=1.0)
             if not acquired:
                 self.get_logger().error(f"Failed to acquire lock to check binding for {material_box_id}")
                 return False
@@ -724,7 +738,7 @@ class CoreSystem(Node):
             raise ValueError(f"Material box ID must be non-negative, got {material_box_id}")
         
         try:
-            acquired = self.mutex.acquire(timeout=3.0)
+            acquired = self.mutex.acquire(timeout=1.0)
             if not acquired:
                 self.get_logger().error("Failed to acquire lock for material box binding")
                 return None
@@ -837,7 +851,7 @@ class CoreSystem(Node):
             raise ValueError(f"Material box ID must be non-negative, got {mtrl_box_id}")
         
         try:
-            acquired = self.mutex.acquire(timeout=3.0)
+            acquired = self.mutex.acquire(timeout=1.0)
             if not acquired:
                 self.get_logger().error(f"Failed to acquire lock for mtrl_box_id {mtrl_box_id}")
                 return None
@@ -883,18 +897,19 @@ class CoreSystem(Node):
     async def move_out_station(self, station: DispenserStation, station_id: int, mtrl_box_id: int) -> bool:
         self.get_logger().info(f"Station {station_id} has all cells completed")
             
-        conveyor = self.conveyor.get_conveyor_by_station(station_id)
-        if conveyor.is_occupied:
-            self.get_logger().info("The conveyor is occupied. Try to move out in the next callback")
+        conveyor_seg = self.conveyor.get_conveyor_by_station(station_id)
+        if conveyor_seg and conveyor_seg.is_occupied:
+            self.get_logger().info("The conveyor segment is occupied. Try to move out in the next callback")
         else:
-            success = await self.write_registers(Const.MOVEMENT_ADDR + station_id, [Const.EXIT_STATION])
+            # success = await self.write_registers(Const.MOVEMENT_ADDR + station_id, [Const.EXIT_STATION])
+            success = run_coroutine_threadsafe(self.write_registers(Const.MOVEMENT_ADDR + station_id, [Const.EXIT_STATION]), self.loop).result()
             if success:
-                conveyor.occupy(mtrl_box_id)
-                station.clear()
-                self.get_logger().info(f"The material box [{mtrl_box_id}] is moving out in station [{station_id}]")
+                with self.mutex:
+                    conveyor_seg.occupy(mtrl_box_id)
+                    station.clear()
                 return True
-            else:
-                self.get_logger().info(f"Failed to move out material box [{mtrl_box_id}] in station [{station_id}]")
+            
+            self.get_logger().info(f"Failed to move out material box [{mtrl_box_id}] in station [{station_id}]")
 
         return False
 
@@ -928,11 +943,8 @@ class CoreSystem(Node):
             self.get_logger().error(f"Invalid start_cell: {target_cell}")
             return False
 
-        self.get_logger().error(f"Try to send the dispense request")
-
         try:
             success = self.send_dispense_req(filtered_missing, station_id, target_cell, order.order_id)
-            self.get_logger().info("Called the Dispense service")
 
             if success:
                 station.set_dispense_req_sent(target_cell, True)
@@ -974,9 +986,6 @@ class CoreSystem(Node):
         if not isinstance(station_id, int) or station_id < 0:
             self.get_logger().error(f"Invalid station_id: {station_id}")
             return None, 0
-        if not 0 <= target_cell < Const.CELLS:
-            self.get_logger().error(f"Invalid start_cell: {target_cell}")
-            return None, 0
         
         try:
             target_cell = station.is_completed.index(False)
@@ -987,7 +996,7 @@ class CoreSystem(Node):
 
         filtered_missing = None
         try:
-            while target_cell < self.const.CELLS:
+            while target_cell < Const.CELLS:
                 self.get_logger().error(f"Checking target_cell: {target_cell}")
                 cell_curr_mtrl_box = status.material_box.slots[target_cell]
                 cell_order_mtrl_box = order.material_box.slots[target_cell]
@@ -1012,8 +1021,12 @@ class CoreSystem(Node):
                 self.get_logger().warning(f"missing_lists: {missing_lists}")
 
                 # Find missing drugs for this station
-                missing = {item for item in required if item not in curr and item[0] == station_id}
-                filtered_missing = [(unit, amount) for _, unit, amount in missing]
+                filtered_missing = [
+                    [item for item in lst if item[0] == station_id]
+                    for lst in missing_lists
+                    if any(item[0] == station_id for item in lst)  # Skip lists with no matching station_id
+                ]
+                self.get_logger().debug(f"filtered_missing: {filtered_missing}")
 
                 self.get_logger().warning(f"Cell {target_cell}: required={required}, curr={curr}, missing at station {station_id}={filtered_missing}")
 
@@ -1021,7 +1034,7 @@ class CoreSystem(Node):
                     self.get_logger().error(f"target_cell: {target_cell} has missing drugs: {filtered_missing}")
                     break
                 else:
-                    station.is_completed[target_cell] = True
+                    station.set_completed(target_cell, True)
                     self.get_logger().info(f"Set target_cell: {target_cell} to True")
                     self.get_logger().error(f"target_cell: {target_cell} is complete")
                     target_cell += 1
@@ -1076,36 +1089,42 @@ class CoreSystem(Node):
         station_ids, register_addr = Const.CAMERA_STATION_PLC_MAP[camera_id]
         available_stations = self.remove_occupied_station(station_ids)
 
-        decision = self.movement_decision_v1(order_id, available_stations)
-        self.get_logger().debug(f"Decision {decision} made from available stations {available_stations} for camera {camera_id}")
+        decision = 0
+        if available_stations:
+            decision = self.movement_decision_v1(order_id, available_stations)
+        self.get_logger().warning(f"Decision {decision} made from available stations {available_stations} for camera {camera_id}")
         
         if decision in available_stations: 
             # try to move into station
             values = Const.STATION_VALUE_MAP.get(decision)
-            
-            success = await self.write_registers(register_addr, values)
+            self.get_logger().warning(f"Move into station {decision} for camera {camera_id}")
+            # success = await self.write_registers(register_addr, values)
+            success = run_coroutine_threadsafe(self.write_registers(register_addr, values), self.loop).result()
             if success:
                 station = self.conveyor.get_station(decision)
                 curr_conveyor = self.conveyor.get_conveyor(camera_id)
                 if station and curr_conveyor:
-                    station.occupy(material_box_id)
-                    curr_conveyor.clear()
+                    with self.mutex:
+                        station.occupy(material_box_id)
+                        curr_conveyor.clear()
                     is_completed = True
             else:
                 self.get_logger().error(f"Failed to write to register {register_addr}")
         else: 
             # try to go straight
             next_conveyor = self.conveyor.get_next_conveyor(camera_id)
-
+            self.get_logger().warning(f"Go straight for camera {camera_id}")
             if next_conveyor and not next_conveyor.is_occupied:
                 values = [1]
 
-                success = await self.write_registers(register_addr, values)
+                # success = await self.write_registers(register_addr, values)
+                success = run_coroutine_threadsafe(self.write_registers(register_addr, values), self.loop).result()
                 if success:
                     curr_conveyor = self.conveyor.get_conveyor(camera_id)
                     if curr_conveyor:
-                        next_conveyor.occupy(material_box_id)
-                        curr_conveyor.clear()
+                        with self.mutex:
+                            next_conveyor.occupy(material_box_id)
+                            curr_conveyor.clear()
                         is_completed = True
                 else:
                     self.get_logger().error(f"Failed to write to register {register_addr}")
@@ -1136,16 +1155,15 @@ class CoreSystem(Node):
 
         remainder = self.find_remainder(order_id)
         if len(remainder) == 0 and self.get_any_pkc_mac_is_idle():
-            pkg_req_success = await self.send_pkg_req(order_id)
+            pkg_req_success = self.send_pkg_req(order_id)
             if pkg_req_success:
                 self.get_logger().warning(f"Sent a packaging request to packaging machine manager successfully")
-                self.proc_order.pop(order_id)
                 self.get_logger().warning(f"Removed the order in the proc_order successfully")
                 is_completed = True
             else:
                 self.get_logger().error(f"Failed to send the packaging request to packaging machine manager") 
         else:
-            block_success = await self.send_income_mtrl_box(material_box_id)
+            block_success = self.send_income_mtrl_box(material_box_id)
             if block_success:
                 self.get_logger().warning(f"Sent a income materail box to packaging machine manager successfully")
             else:
@@ -1156,7 +1174,8 @@ class CoreSystem(Node):
             if self.is_releasing_mtrl_box:
                 self.get_logger().debug(f"Skipped elevator movement for box {material_box_id} (currently releasing)")
             else: 
-                elevator_success = await self.write_registers(5200, [1])
+                # elevator_success = await self.write_registers(5200, [3])
+                elevator_success = run_coroutine_threadsafe(self.write_registers(5200, [3]), self.loop).result()
                 if elevator_success:
                     is_completed = True
                     self.get_logger().warning(f"Sent elevator request successfully")
@@ -1185,8 +1204,9 @@ class CoreSystem(Node):
 
         if self.is_releasing_mtrl_box:
             self.get_logger().debug(f"Skipped elevator movement for box {material_box_id} (currently releasing)")
-        else: 
-            elevator_success = await self.write_registers(5200, [1])
+        elif not self.is_elevator_ready:
+            # elevator_success = await self.write_registers(5200, [1])
+            elevator_success = run_coroutine_threadsafe(self.write_registers(5200, [1]), self.loop).result()
             if elevator_success:
                 is_completed = True
                 self.get_logger().warning(f"Sent elevator request successfully")
@@ -1195,7 +1215,7 @@ class CoreSystem(Node):
         
         con_mtrl_box_success = self.send_con_mtrl_box(material_box_id)
 
-        is_completed = elevator_success # and con_mtrl_box_success
+        is_completed = True# elevator_success # and con_mtrl_box_success
 
         self.get_logger().info(f"Packaging machine 2 triggered for material box [{material_box_id}]")
         return is_completed
@@ -1258,7 +1278,7 @@ class CoreSystem(Node):
             self.get_logger().error(f"Service call failed for ID {mtrl_box_id}: {str(e)}")
             return False
 
-    async def send_pkg_req(self, order_id) -> Optional[bool]:
+    def send_pkg_req(self, order_id) -> Optional[bool]:
         """
         Send a packaging request for a specific order.
         
@@ -1309,10 +1329,14 @@ class CoreSystem(Node):
             _date = proc_order.start_date
             try:
                 dt = datetime.strptime(_date, "%Y-%m-%d")
+                self.get_logger().warning(f"dt: {dt}")
                 days_to_add = (proc_order.start_meal + i) // 4  # integer division
                 new_date = dt + timedelta(days=days_to_add)     # Add the days to the original datetime
+                self.get_logger().warning(f"new_date: {new_date}")
+                self.get_logger().warning(f"new_date.strftime('%Y-%m-%d'): {new_date.strftime('%Y-%m-%d')}")
                 info.date = f"Date: {new_date.strftime('%Y-%m-%d')}"
             except ValueError as e:
+                info.date = "ERROR"
                 self.get_logger().error(f"Invalid date format for order {order_id}: {str(e)}")
 
             info.qr_code = "https://www.hkclr.hk"
@@ -1320,7 +1344,7 @@ class CoreSystem(Node):
             for drug in proc_order.material_box.slots[i].drugs:
                 drug_str = f"{drug.name}   {drug.amount}"
                 self.get_logger().info(f"Added to order {order_id}: {drug_str}")
-                req.print_info.drugs.append(drug_str)
+                info.drugs.append(drug_str)
 
         while not self.pkg_order_cli.wait_for_service(timeout_sec=1.0):
             if not rclpy.ok():
@@ -1380,13 +1404,13 @@ class CoreSystem(Node):
             self.get_logger().error(f"Service call failed for ID {mtrl_box_id}: {str(e)}")
             return False
 
-    def send_dispense_req(self, filtered_missing: List[List], station_id: int, cell_no: int, order_id: int) -> Optional[bool]:
+    def send_dispense_req(self, filtered_missing, station_id: int, cell_no: int, order_id: int) -> Optional[bool]:
         self.get_logger().info("send_dispense_req start")
         
         req = DispenseDrug.Request()
         for item in filtered_missing:
-            req.content.append(DispenseContent(unit_id=item[0], amount=item[1]))
-        self.get_logger().error(f"req: {req}")
+            req.content.append(DispenseContent(unit_id=item[1], amount=item[2]))
+        self.get_logger().warning(f"req: {req}")
 
         while not self.get_dis_station_cli(station_id).wait_for_service(timeout_sec=1.0):
             if not rclpy.ok():
@@ -1545,7 +1569,7 @@ class CoreSystem(Node):
         res = future.result()
 
         if res and res.success:
-            self.get_logger().info(f"Dispense drug in station {station_id} successfully")
+            self.get_logger().debug(f"Dispense drug in station {station_id} successfully")
 
             station = self.conveyor.get_station(station_id)
             station.set_completed(cell_no, True)
@@ -1557,8 +1581,8 @@ class CoreSystem(Node):
                     for item in filtered_missing: 
                         new_detail = DispensingDetail()
                         new_detail.location.dispenser_station = station_id
-                        new_detail.location.dispenser_unit = item[0]
-                        new_detail.amount = item[1]
+                        new_detail.location.dispenser_unit = item[1]
+                        new_detail.amount = item[2]
                         try:
                             status.material_box.slots[cell_no].dispensing_detail.append(new_detail)
                         except Exception as e:

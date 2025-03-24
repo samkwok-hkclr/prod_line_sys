@@ -9,23 +9,22 @@ class ConveyorSegment:
         self._is_occupied: bool = False
         self.l_station: DispenserStation = l_station
         self.r_station: DispenserStation = r_station
-        self.right_station = None
         self.next = None
 
         self.mutex = Lock()
 
     def clear(self):
         with self.mutex:
-            self.curr_mtrl_box = 0
-            self.is_occupied = False
+            self._curr_mtrl_box = 0
+            self._is_occupied = False
 
     def occupy(self, mtrl_box_id: int):
         if not isinstance(mtrl_box_id, int):
             raise TypeError(f"Expected integer id, got {type(mtrl_box_id).__name__}")
         
         with self.mutex:
-            self.curr_mtrl_box = mtrl_box_id
-            self.is_occupied = False
+            self._curr_mtrl_box = mtrl_box_id
+            self._is_occupied = True
 
     @property
     def curr_mtrl_box(self):
