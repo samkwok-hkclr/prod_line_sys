@@ -2,6 +2,15 @@ from typing import final, Final, Dict
 
 @final
 class Const:
+    CAMERA_ID_START: Final[int] = 1
+    CAMERA_ID_END: Final[int] = 11
+
+    MTRL_BOX_ID_START: Final[int] = 1
+    MTRL_BOX_ID_END: Final[int] = 20
+
+    PKG_MAC_ID_START: Final[int] = 1
+    PKG_MAC_ID_END: Final[int] = 1
+
     GO_STRAIGHT: Final[int] = 0
     
     CELLS: Final[int] = 28
@@ -10,6 +19,7 @@ class Const:
     NUM_DISPENSER_STATIONS: Final[int] = 14
 
     MOVEMENT_ADDR: Final[int] = 5000
+    
     CAMERA_STATION_PLC_MAP: Final[Dict] = {
         1: ([1, 2],   5201),
         2: ([3, 4],   5202),
