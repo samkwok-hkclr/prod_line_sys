@@ -141,7 +141,7 @@ class CoreSystem(Node):
         self.get_logger().info("Service Clients are created")
 
         # Timers
-        self.qr_handle_timer = self.create_timer(2.0, self.qr_handle_cb, callback_group=qr_handle_timer_cbg)
+        self.qr_handle_timer = self.create_timer(1.0, self.qr_handle_cb, callback_group=qr_handle_timer_cbg)
         self.start_order_timer = self.create_timer(1.0, self.start_order_cb, callback_group=normal_timer_cbg)
         self.order_status_timer = self.create_timer(1.0, self.order_status_cb, callback_group=normal_timer_cbg)
         self.elevator_timer = self.create_timer(1.0, self.elevator_dequeue_cb, callback_group=normal_timer_cbg)
@@ -203,7 +203,7 @@ class CoreSystem(Node):
                 if station is None:
                     self.get_logger().warning(f"No station found for ID {station_id} <<<< 1")
                     continue
-                platform_location_mapped = self.inverse_map_index_minus_one(platform_location)
+                platform_location_mapped = self.inverse_map_index(platform_location)
                 station.curr_sliding_platform = platform_location_mapped
                 updated_stations.append((station_id, platform_location_mapped))
 
@@ -235,7 +235,7 @@ class CoreSystem(Node):
                 if station is None:
                     self.get_logger().warning(f"No station found for ID {station_id} <<<< 2")
                     continue
-                state_mapped = self.inverse_map_index_minus_one(state)
+                state_mapped = self.inverse_map_index(state)
                 station.cmd_sliding_platform = state_mapped
                 updated_stations.append((station_id, state_mapped))
 
@@ -373,10 +373,11 @@ class CoreSystem(Node):
         success = future.result()
         if success:
             with self.mutex:
-                order = self.recv_order.popleft()
-                self.proc_order[order.order_id] = order
-
-                status = self.mtrl_box_status.get(order.order_id)
+                # order = self.recv_order.popleft()
+                highest_priority_order = max(self.recv_order, key=lambda _order: _order.priority)
+                self.proc_order[highest_priority_order.order_id] = deepcopy(highest_priority_order)
+                status = self.mtrl_box_status.get(highest_priority_order.order_id)
+                self.recv_order.remove(highest_priority_order)
                 if not status:
                     status.start_time = self.get_clock().now().to_msg()
             self.get_logger().info(">>> Added a order to processing queue")
@@ -512,12 +513,12 @@ class CoreSystem(Node):
         elif cmd_sliding_platform == 0 or \
              cmd_sliding_platform != curr_sliding_platform or \
              cmd_sliding_platform != target_cell + 1:
-            self.get_logger().debug(f"station: {station_id} is sending the movement command")
+            self.get_logger().info(f"station: {station_id} is sending the movement command")
             # success = await self.write_registers(Const.MOVEMENT_ADDR + station_id, [target_cell + 1])
             future = run_coroutine_threadsafe(
                 self.write_registers(
                     Const.MOVEMENT_ADDR + station_id, 
-                    [self.map_index_plus_one(target_cell)]
+                    [self.map_index(target_cell + 1)]
                 ), 
                 self.loop)
             success = future.result()
@@ -590,7 +591,7 @@ class CoreSystem(Node):
             res.message = "Parameters must be integers"
             return res
         
-        if not (0 < cell_no <= Const.EXIT_STATION):
+        if not (1 <= cell_no <= Const.EXIT_STATION):
             self.get_logger().error(f"Invalid cell_no {cell_no}: must be between 1 and 29")
             res.message = f"Cell number {cell_no} out of range (1-29)"
             return res
@@ -601,7 +602,7 @@ class CoreSystem(Node):
             return res
         
         address = Const.MOVEMENT_ADDR + station_id
-        values = [self.map_index_plus_one(cell_no)]
+        values = [self.map_index(cell_no)]
 
         # success = await self.write_registers(/address, values)
         future = run_coroutine_threadsafe(self.write_registers(address, values), self.loop)
@@ -1249,7 +1250,13 @@ class CoreSystem(Node):
                 self.get_logger().error(f"Failed to write to register for elevator")
         
         con_mtrl_box_success = self.send_con_mtrl_box(material_box_id)
-        self.elevator_request.append(self.get_clock().now())
+        not_found = True
+        for _tuple in self.elevator_request:
+            if _tuple[0] == material_box_id:
+                not_found = False
+                break
+        if not_found:
+            self.elevator_request.append((material_box_id, self.get_clock().now()))
 
         is_completed = True# elevator_success # and con_mtrl_box_success
 
@@ -1640,19 +1647,23 @@ class CoreSystem(Node):
 
     # from HKCLR to Production Line PLC
     def map_index(self, index: int) -> int:
-        return (index // 4) + (index % 4) * 7
-
-    # from HKCLR to Production Line PLC with plus one
-    def map_index_plus_one(self, index: int) -> int:
-        return (index // 4) + (index % 4) * 7 + 1
+        if index == 0:
+            return 0
+        if not (1 <= index <= 28):
+            return 0
+        if index == Const.EXIT_STATION:
+            return index
+        return ((index-1) // 4) + ((index-1) % 4) * 7 + 1
     
     # from Production Line PLC to HKCLR 
     def inverse_map_index(self, index: int) -> int:
-        return (index // 7) + (index % 7) * 4
-
-    # from Production Line PLC to HKCLR with minus one
-    def inverse_map_index_minus_one(self, index: int) -> int:
-        return ((index - 1) // 7) + ((index - 1) % 7) * 4
+        if index == 0:
+            return 0
+        if not (1 <= index <= 28):
+            return 0
+        if index == Const.EXIT_STATION:
+            return index
+        return ((index-1) // 7) + ((index-1) % 7) * 4 + 1
 
     def run_loop(self):
         """Run the asyncio event loop in a dedicated thread."""

@@ -227,7 +227,7 @@ class NewOrderActionServer(Node):
                 result.response.message = "Material box assignment timed out"
                 self.get_logger().error(f"Timeout after {retries} retries for order_id={order_id}")
 
-            self.get_logger().warning(f"Oh yeah! The action are handled order_id={order_id}).")
+            self.get_logger().warning(f"Oh yeah! The action are handled order_id={order_id}")
             goal_handle.succeed()
             return result
         

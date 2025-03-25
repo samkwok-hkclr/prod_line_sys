@@ -9,7 +9,7 @@ class Const:
     MTRL_BOX_ID_END: Final[int] = 20
 
     PKG_MAC_ID_START: Final[int] = 1
-    PKG_MAC_ID_END: Final[int] = 1
+    PKG_MAC_ID_END: Final[int] = 2
 
     GO_STRAIGHT: Final[int] = 0
     
