@@ -49,6 +49,7 @@ from .const import Const
 class CoreSystem(Node):
     def __init__(self, executor):
         super().__init__("core_system")
+        self.exec = executor
         
         # FIXME: try to save in database later
         # Local memory storage, 
@@ -61,8 +62,6 @@ class CoreSystem(Node):
 
         self.pkg_mac_status: Dict[int, PackagingMachineStatus] = {} # pkg_mac_id, PackagingMachineStatus
 
-        self.exec = executor
-
         # ROS2 client node, maybe unused
         self.cli_node = rclpy.create_node("cli_node")
         self.exec.add_node(self.cli_node)
@@ -70,6 +69,7 @@ class CoreSystem(Node):
         # mutex
         self.mutex = Lock()
         self.qr_scan_mutex = Lock()
+        self.elevator_mutex = Lock()
 
         # Graph of conveyor structure
         self.conveyor = None
@@ -98,7 +98,6 @@ class CoreSystem(Node):
         normal_timer_cbg = MutuallyExclusiveCallbackGroup()
         qr_handle_timer_cbg = MutuallyExclusiveCallbackGroup()
         station_timer_cbgs = [MutuallyExclusiveCallbackGroup() for _ in range(Const.NUM_DISPENSER_STATIONS)]
-
         self.get_logger().info("Callback groups are created")
 
         # Publishers
@@ -297,7 +296,7 @@ class CoreSystem(Node):
         """
         state_changed = False
         timestamp = self.get_clock().now()
-        with self.mutex:
+        with self.elevator_mutex:
             prev_elevator_ready = self.is_elevator_ready
             self.is_elevator_ready = msg.data
 
@@ -362,7 +361,7 @@ class CoreSystem(Node):
     async def start_order_cb(self) -> None:
         with self.mutex:
             if len(self.elevator_request) > 0:
-                self.get_logger().warning("The material box retrieval have higher priority")
+                self.get_logger().debug("The material box retrieval have higher priority")
                 return
             if len(self.recv_order) == 0 or not self.is_plc_connected or self.is_releasing_mtrl_box:
                 return
@@ -508,7 +507,7 @@ class CoreSystem(Node):
 
         if target_cell >= Const.EXIT_STATION:
             self.get_logger().error(f"The station {station_id} is completed dispense for the material box {mtrl_box_id}")
-            success = await self.move_out_station(station, station_id, mtrl_box_id)
+            success = self.move_out_station(station, station_id, mtrl_box_id)
             
         elif cmd_sliding_platform == 0 or \
              cmd_sliding_platform != curr_sliding_platform or \
@@ -523,15 +522,15 @@ class CoreSystem(Node):
                 self.loop)
             success = future.result()
             if success:
-                self.get_logger().info(f"station: {station_id} is moving to {target_cell + 1} cell")
+                self.get_logger().warning(f"station: {station_id} is moving to {target_cell + 1} cell")
             else:
                 self.get_logger().error(f"write_registers movement failed")
         
         elif station.get_dispense_req_sent(target_cell):
-            self.get_logger().warning(f"The station {[station_id]} dispense request are already sent! skip!")
+            self.get_logger().debug(f"The station {[station_id]} dispense request are already sent! skip!")
             
         elif filtered_missing:
-            self.get_logger().info(f"try to dispense")
+            self.get_logger().debug(f"try to dispense")
             success = self.dispense_action(station, station_id, filtered_missing[0], order, target_cell)
 
         self.get_logger().debug(f"The station {[station_id]} decision are made!!")
@@ -1075,6 +1074,7 @@ class CoreSystem(Node):
                 self.get_logger().warning(f"Cell {target_cell}: required={required}, curr={curr}, missing at station {station_id}={filtered_missing}")
 
                 if filtered_missing:
+                    station.set_verified(target_cell, True)
                     self.get_logger().error(f"target_cell: {target_cell} has missing drugs: {filtered_missing}")
                     break
                 else:
@@ -1133,6 +1133,10 @@ class CoreSystem(Node):
         station_ids, register_addr = Const.CAMERA_STATION_PLC_MAP[camera_id]
         available_stations = self.remove_occupied_station(station_ids)
 
+        # update location
+        if status := self.mtrl_box_status.get(order_id):
+            status.location = str(camera_id)
+
         decision = 0
         if available_stations:
             decision = self.movement_decision_v1(order_id, available_stations)
@@ -1160,8 +1164,7 @@ class CoreSystem(Node):
             next_conveyor = self.conveyor.get_next_conveyor(camera_id)
             self.get_logger().warning(f"Go straight for camera {camera_id}")
             if next_conveyor and not next_conveyor.is_occupied:
-                values = [1]
-
+                values = Const.STRAIGHT_VALUE
                 # success = await self.write_registers(register_addr, values)
                 future = run_coroutine_threadsafe(self.write_registers(register_addr, values), self.loop)
                 success = future.result()
@@ -1248,15 +1251,12 @@ class CoreSystem(Node):
                 self.get_logger().warning(f"Sent elevator request successfully")
             else:
                 self.get_logger().error(f"Failed to write to register for elevator")
-        
+   
+        with self.elevator_mutex:
+            if not any(req[0] == material_box_id for req in self.elevator_request):
+                self.elevator_request.append((material_box_id, self.get_clock().now()))
+
         con_mtrl_box_success = self.send_con_mtrl_box(material_box_id)
-        not_found = True
-        for _tuple in self.elevator_request:
-            if _tuple[0] == material_box_id:
-                not_found = False
-                break
-        if not_found:
-            self.elevator_request.append((material_box_id, self.get_clock().now()))
 
         is_completed = True# elevator_success # and con_mtrl_box_success
 
@@ -1452,7 +1452,6 @@ class CoreSystem(Node):
         if not all(isinstance(x, (int)) for x in [station_id, cell_no, order_id]):
             self.get_logger().error("Invalid integer types provided")
             return False
-        self.get_logger().debug("send_dispense_req start")
         
         req = DispenseDrug.Request()
         for item in filtered_missing:
@@ -1579,9 +1578,10 @@ class CoreSystem(Node):
         res = future.result()
 
         if res and res.success:
-            if len(self.elevator_queue) > 0:
-                self.elevator_queue.popleft()
-                self.get_logger().info(f"Removed from elevator_queue successfully")
+            with self.elevator_mutex:   
+                if len(self.elevator_queue) > 0:
+                    self.elevator_queue.popleft()
+                    self.get_logger().info(f"Removed from elevator_queue successfully")
 
             self.get_logger().info(f"Sent the release blocking successfully")
         else:
@@ -1645,25 +1645,47 @@ class CoreSystem(Node):
         else:
             self.get_logger().error(f"Service call succeeded but reported failure for dispenser station: {station_id}")
 
-    # from HKCLR to Production Line PLC
     def map_index(self, index: int) -> int:
-        if index == 0:
-            return 0
-        if not (1 <= index <= 28):
-            return 0
-        if index == Const.EXIT_STATION:
-            return index
-        return ((index-1) // 4) + ((index-1) % 4) * 7 + 1
+        """Maps HKCLR index position to Production Line PLC index.
     
-    # from Production Line PLC to HKCLR 
-    def inverse_map_index(self, index: int) -> int:
+        Args:
+            index: An integer representing the position (0, EXIT_STATION, or 1-28)
+            
+        Returns:
+            Mapped Production Line PLC position number
+            
+        Raises:
+            ValueError: If index is not 0, EXIT_STATION, or between 1 and 28
+        """
         if index == 0:
-            return 0
-        if not (1 <= index <= 28):
             return 0
         if index == Const.EXIT_STATION:
             return index
-        return ((index-1) // 7) + ((index-1) % 7) * 4 + 1
+        if not (1 <= index <= Const.CELLS):
+            raise Exception("map index out of range")
+        idx = index - 1
+        return (idx // Const.GRID_HEIGHT) + (idx % Const.GRID_HEIGHT) * Const.GRID_WIDTH + 1
+    
+    def inverse_map_index(self, index: int) -> int:
+        """Maps Production Line PLC index position to HKCLR index.
+    
+        Args:
+            index: An integer representing the position (0, EXIT_STATION, or 1-28)
+            
+        Returns:
+            Mapped HKCLR index position number
+            
+        Raises:
+            ValueError: If index is not 0, EXIT_STATION, or between 1 and 28
+        """
+        if index == 0:
+            return 0
+        if index == Const.EXIT_STATION:
+            return index
+        if not (1 <= index <= Const.CELLS):
+            raise Exception("map index out of range")
+        idx = index - 1
+        return (idx // Const.GRID_WIDTH) + (idx % Const.GRID_WIDTH) * Const.GRID_HEIGHT + 1
 
     def run_loop(self):
         """Run the asyncio event loop in a dedicated thread."""

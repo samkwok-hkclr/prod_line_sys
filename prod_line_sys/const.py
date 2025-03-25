@@ -1,7 +1,10 @@
-from typing import final, Final, Dict
+from typing import final, Final, Dict, List
 
 @final
 class Const:
+    GRID_WIDTH:Final[int] = 7
+    GRID_HEIGHT:Final[int] = 4
+
     CAMERA_ID_START: Final[int] = 1
     CAMERA_ID_END: Final[int] = 11
 
@@ -20,6 +23,7 @@ class Const:
 
     MOVEMENT_ADDR: Final[int] = 5000
     
+    STRAIGHT_VALUE: Final[List] = [1]
     CAMERA_STATION_PLC_MAP: Final[Dict] = {
         1: ([1, 2],   5201),
         2: ([3, 4],   5202),

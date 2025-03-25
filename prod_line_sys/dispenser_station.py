@@ -13,6 +13,7 @@ class DispenserStation:
         self._is_completed: List[bool] = [False] * Const().CELLS
         self._is_dispense_req_sent: List[bool] = [False] * Const.CELLS
         self._is_dispense_req_done: List[bool] = [False] * Const.CELLS
+        self._is_verified: List[bool] = [False] * Const.CELLS
         self._is_platform_ready: bool = False
         
         self.mutex = Lock()
@@ -25,6 +26,7 @@ class DispenserStation:
             self._is_completed = [False] * Const.CELLS
             self._is_dispense_req_sent = [False] * Const.CELLS
             self._is_dispense_req_done = [False] * Const.CELLS
+            self._is_verified = [False] * Const.CELLS
 
     def occupy(self, mtrl_box_id: int):
         if not isinstance(mtrl_box_id, int):
@@ -138,6 +140,21 @@ class DispenserStation:
             raise TypeError(f"Expected boolean, got {type(value).__name__}")
         with self.mutex:
             self._is_dispense_req_done[index] = value
+
+    # Getter and Setter methods for _is_verified with index
+    def get_verified(self, index: int) -> bool:
+        if not 0 <= index < Const().CELLS:
+            raise IndexError(f"Index {index} out of range [0, {Const().CELLS-1}]")
+        with self.mutex:
+            return self._is_verified[index]
+
+    def set_verified(self, index: int, value: bool):
+        if not 0 <= index < Const().CELLS:
+            raise IndexError(f"Index {index} out of range [0, {Const().CELLS-1}]")
+        if not isinstance(value, bool):
+            raise TypeError(f"Expected boolean, got {type(value).__name__}")
+        with self.mutex:
+            self._is_verified[index] = value
 
     def __str__(self):
         return f"Station id:{self.id}, box:{self.curr_mtrl_box}, occupied:{self.is_occupied}"
