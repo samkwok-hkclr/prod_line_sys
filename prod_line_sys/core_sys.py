@@ -13,12 +13,15 @@ from functools import partial
 import rclpy
 
 from rclpy.node import Node
+from rclpy.action import ActionClient
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 
+from action_msgs.msg import GoalStatus
 from std_msgs.msg import Bool, UInt8MultiArray
 from std_srvs.srv import Trigger
 
+from smdps_msgs.action import VisualDetection
 from smdps_msgs.msg import (CameraState, 
                             CameraStatus, 
                             CameraTrigger, 
@@ -32,7 +35,6 @@ from smdps_msgs.msg import (CameraState,
                             DispenseContent,
                             DispensingDetail,
                             DrugLocation)
-
 from smdps_msgs.srv import (NewOrder, 
                             ReadRegister, 
                             WriteRegister, 
@@ -59,6 +61,9 @@ class CoreSystem(Node):
         self.qr_scan: List[CameraTrigger] = []
         self.elevator_queue = deque()
         self.elevator_request = deque()
+        self.vision_request = deque()
+
+        self.num_of_mtrl_box_in_container = 0
 
         self.pkg_mac_status: Dict[int, PackagingMachineStatus] = {} # pkg_mac_id, PackagingMachineStatus
 
@@ -70,6 +75,7 @@ class CoreSystem(Node):
         self.mutex = Lock()
         self.qr_scan_mutex = Lock()
         self.elevator_mutex = Lock()
+        self.vision_mutex = Lock()
 
         # Graph of conveyor structure
         self.conveyor = None
@@ -88,11 +94,13 @@ class CoreSystem(Node):
         self.is_plc_connected = False
         self.is_releasing_mtrl_box = False
         self.is_elevator_ready = False
+        self.is_vision_block_released = False
 
         # Callback groups
         sub_cbg = MutuallyExclusiveCallbackGroup()
         srv_ser_cbg = MutuallyExclusiveCallbackGroup()
         srv_cli_cbg = MutuallyExclusiveCallbackGroup()
+        action_cli_cbg = MutuallyExclusiveCallbackGroup()
         station_srv_cli_cbgs = [MutuallyExclusiveCallbackGroup() for _ in range(Const.NUM_DISPENSER_STATIONS)]
 
         normal_timer_cbg = MutuallyExclusiveCallbackGroup()
@@ -113,6 +121,8 @@ class CoreSystem(Node):
         self.elevator_sub = self.create_subscription(Bool, "elevator", self.elevator_cb, 10, callback_group=sub_cbg)
         self.qr_scan_sub = self.create_subscription(CameraTrigger, "qr_camera_scan", self.qr_scan_cb, 10, callback_group=sub_cbg)
         self.pkg_mac_status_sub = self.create_subscription(PackagingMachineStatus, "packaging_machine_status", self.pkg_mac_status_cb, 10, callback_group=sub_cbg)
+        self.vision_block_sub = self.create_subscription(Bool, "vision_block", self.vision_block_cb, 10, callback_group=sub_cbg)
+        self.con_mtrl_box_sub = self.create_subscription(Bool, "container_material_box", self.con_mtrl_box_cb, 10, callback_group=sub_cbg)
         self.get_logger().info("Subscriptions are created")
         
         # Service servers
@@ -123,12 +133,12 @@ class CoreSystem(Node):
         # Service clients
         self.read_cli = self.create_client(ReadRegister, "read_register", callback_group=srv_cli_cbg)
         self.write_cli = self.create_client(WriteRegister, "write_register", callback_group=srv_cli_cbg)
+        self.init_vision_cli = self.create_client(Trigger, "init_visual_camera", callback_group=srv_cli_cbg)
         self.income_mtrl_box_cli = self.create_client(UInt8, "income_material_box", callback_group=srv_cli_cbg)
         self.con_mtrl_box_cli = self.create_client(UInt8, "container_material_box", callback_group=srv_cli_cbg)
         self.rel_blocking_cli = self.create_client(Trigger, "release_blocking", callback_group=srv_cli_cbg)
         self.pkg_order_cli = self.create_client(PackagingOrder, "packaging_order", callback_group=srv_cli_cbg)
         self.dis_station_clis: Dict[int, rclpy.client.Client] = dict() # station_id, Client
-        # self._initialize_dis_station_clis(srv_cli_cbg)
         for i in range(1, Const.NUM_DISPENSER_STATIONS + 1):
             cbg_index = int(i - 1)
             self.dis_station_clis[i] = self.create_client(
@@ -144,8 +154,8 @@ class CoreSystem(Node):
         self.start_order_timer = self.create_timer(1.0, self.start_order_cb, callback_group=normal_timer_cbg)
         self.order_status_timer = self.create_timer(1.0, self.order_status_cb, callback_group=normal_timer_cbg)
         self.elevator_timer = self.create_timer(1.0, self.elevator_dequeue_cb, callback_group=normal_timer_cbg)
+        self.init_vision_timer = self.create_timer(30.0, self.init_vision_cb, callback_group=normal_timer_cbg)
         self.dis_station_timers: Dict[int, rclpy.Timer.Timer] = dict()
-        # self._initialize_dis_station_timers(1.0, station_timer_cbgs)
         for i in range(1, Const.NUM_DISPENSER_STATIONS + 1):
             cbg_index = int(i - 1)
             self.dis_station_timers[i] = self.create_timer(
@@ -153,8 +163,16 @@ class CoreSystem(Node):
                 lambda station_id=i: self.exec.create_task(self.station_decision_cb(station_id)),
                 callback_group=station_timer_cbgs[cbg_index]
             )
-            self.get_logger().info(f"Station [{i}] timer is created  w/ {station_timer_cbgs[cbg_index]}")
+            self.get_logger().info(f"Station [{i}] timer is created w/ {station_timer_cbgs[cbg_index]}")
         self.get_logger().info("Timers are created")
+
+        # Action clients
+        self.visual_action_cli = ActionClient(
+            self, 
+            VisualDetection, 
+            "visual_detection",
+            callback_group=action_cli_cbg
+        )
         
         self.get_logger().info("Produation Line Core System Node is started")
 
@@ -357,6 +375,39 @@ class CoreSystem(Node):
         with self.mutex:
             self.pkg_mac_status[machine_id] = msg
 
+    def vision_block_cb(self, msg: Bool) -> None:
+        """
+        Handle vision block update messages.
+        
+        Updates vision block state and manages queue when state changes from not ready to ready.
+        
+        Args:
+            msg: Bool message containing vision block status
+        """
+        state_changed = False
+        timestamp = self.get_clock().now()
+        with self.vision_mutex:
+            prev_vision_block_state = self.is_vision_block_released
+            self.is_vision_block_released = msg.data
+
+            # Check for state transition (0 -> 1)
+            if msg.data and not prev_vision_block_state:
+                state_changed = True
+
+        if state_changed:
+            if len(self.vision_request) > 0:
+                self.send_vision_req(self.vision_request.popleft())
+            self.get_logger().info(f"Vision block state changed 0 -> 1 at {timestamp}. Queue size: {len(self.vision_request)}")
+        elif msg.data != prev_vision_block_state:
+            self.get_logger().debug(f"EleVision blockvator state changed 1 -> 0. Queue size: {len(self.vision_request)}")
+
+    def con_mtrl_box_cb(self, msg: UInt8) -> None:
+        if not (0 <= msg.data <= Const.MAX_MTRL_BOX_IN_CON):
+            self.get_logger().error(f"Invalid number of material box in container: {msg.data}")
+            return
+        with self.mutex:
+            self.num_of_mtrl_box_in_container = msg.data
+
     # Timers callback
     async def start_order_cb(self) -> None:
         with self.mutex:
@@ -364,6 +415,9 @@ class CoreSystem(Node):
                 self.get_logger().debug("The material box retrieval have higher priority")
                 return
             if len(self.recv_order) == 0 or not self.is_plc_connected or self.is_releasing_mtrl_box:
+                return
+            if self.num_of_mtrl_box_in_container == 0:
+                self.get_logger().error("The material box is zero in container")
                 return
         self.get_logger().info("The received queue stored a order")
 
@@ -422,6 +476,8 @@ class CoreSystem(Node):
 
         self.send_rel_blocking()
         
+    def init_vision_cb(self) -> None:
+        self.send_init_vision()
 
     async def qr_handle_cb(self) -> None:
         with self.qr_scan_mutex:
@@ -508,7 +564,9 @@ class CoreSystem(Node):
         if target_cell >= Const.EXIT_STATION:
             self.get_logger().error(f"The station {station_id} is completed dispense for the material box {mtrl_box_id}")
             success = self.move_out_station(station, station_id, mtrl_box_id)
-            
+            # FIXME: move opposite station if needed 
+            # if success:
+            #     decision = self.movement_decision_v1(order_id, available_stations)
         elif cmd_sliding_platform == 0 or \
              cmd_sliding_platform != curr_sliding_platform or \
              cmd_sliding_platform != target_cell + 1:
@@ -519,7 +577,8 @@ class CoreSystem(Node):
                     Const.MOVEMENT_ADDR + station_id, 
                     [self.map_index(target_cell + 1)]
                 ), 
-                self.loop)
+                self.loop
+            )
             success = future.result()
             if success:
                 self.get_logger().warning(f"station: {station_id} is moving to {target_cell + 1} cell")
@@ -1185,6 +1244,11 @@ class CoreSystem(Node):
     
     async def camera_9_action(self, order_id: int, material_box_id: int) -> Optional[bool]:
         is_completed = True
+        
+        # FIXME: Wait the vision system complete
+        # remainder = self.find_remainder(order_id)
+        # if len(remainder) == 0:
+        #     self.vision_request.append(order_id)
 
         self.get_logger().info(f"Vision inspection triggered for material box [{material_box_id}]")
         return is_completed
@@ -1202,6 +1266,7 @@ class CoreSystem(Node):
         """
         is_completed = False
 
+        # FIXME: No need to find reminder if vision inspiration is done
         remainder = self.find_remainder(order_id)
 
         if len(remainder) == 0 and self.get_any_pkc_mac_is_idle():
@@ -1263,6 +1328,26 @@ class CoreSystem(Node):
         self.get_logger().info(f"Packaging machine 2 triggered for material box [{material_box_id}]")
         return is_completed
     
+    def send_init_vision(self)-> Optional[bool]:
+        while not self.init_vision_cli.wait_for_service(timeout_sec=1.0):
+            if not rclpy.ok():
+                return None
+            self.get_logger().info("init_visual_camera Service not available, waiting again...")
+        
+        req = Trigger.Request()
+
+        try:
+            future = self.init_vision_cli.call_async(req)
+            future.add_done_callback(self.init_vision_done_cb)
+
+            return True
+        except AttributeError as e:
+            self.get_logger().error(f"Invalid service response: {str(e)}")
+            return False
+        except Exception as e:
+            self.get_logger().error(f"Service call failed: {str(e)}")
+            return False
+
     def send_rel_blocking(self)-> Optional[bool]:
         while not self.rel_blocking_cli.wait_for_service(timeout_sec=1.0):
             if not rclpy.ok():
@@ -1574,6 +1659,39 @@ class CoreSystem(Node):
             self.get_logger().error(f"Failed to write registers at {address}: {str(e)}")
             return False
     
+    def send_vision_req(self, order_id: int) -> Optional[bool]:
+        if not isinstance(order_id, int):
+            raise TypeError(f"Expected integer order_id, got {type(address).__name__}")
+
+        while not self.visual_action_cli.wait_for_service(timeout_sec=1.0):
+            if not rclpy.ok():
+                return None
+            self.get_logger().info("Waiting for vision action server not available, waiting again...")
+
+        goal_msg = VisualDetection.Goal(order_id = order_id)
+
+        self.get_logger().info("Sending goal request...")
+        try:
+            future = self.visual_action_cli.send_goal_async(
+                goal_msg,
+                feedback_callback=self.vision_feedback_cb
+            )
+            future.add_done_callback(self.vision_goal_response_cb)
+            return True
+        except Exception as e:
+            self.get_logger().error(f"Failed to write registers at {address}: {str(e)}")
+            return False
+
+    def init_vision_done_cb(self, future) -> None:
+        res = future.result()
+
+        if res and res.success:
+            self.init_vision_timer.cancel()
+            self.get_logger().info(f"Stopped the init vision timer")
+            self.get_logger().info(f"Sent the init visual camera successfully")
+        else:
+            self.get_logger().error("Failed to send init visual camera")
+
     def elevator_dequeue_done_cb(self, future) -> None:
         res = future.result()
 
@@ -1644,6 +1762,28 @@ class CoreSystem(Node):
             self.get_logger().info(f"Dispense completed for station {station_id}, cell {cell_no}")
         else:
             self.get_logger().error(f"Service call succeeded but reported failure for dispenser station: {station_id}")
+
+    def vision_goal_response_cb(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().info("Goal rejected")
+            return
+
+        self.get_logger().info("Goal accepted")
+        future = goal_handle.get_result_async()
+        future.add_done_callback(self.vision_result_cb)
+
+    def vision_feedback_cb(self, feedback):
+        self.get_logger().info(f"Received feedback: {feedback.feedback.running}")
+
+    def vision_result_cb(self, future):
+        result = future.result().result
+        status = future.result().status
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().info("Goal succeeded! Result: ")
+        else:
+            self.get_logger().info("Goal failed with status: ")
+
 
     def map_index(self, index: int) -> int:
         """Maps HKCLR index to Production Line PLC index.
