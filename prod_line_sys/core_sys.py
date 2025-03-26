@@ -62,9 +62,9 @@ class CoreSystem(Node):
         self.elevator_queue = deque()
         self.elevator_request = deque()
         self.vision_request = deque()
+        self.jack_up_queue = deque()
 
         self.num_of_mtrl_box_in_container = 0
-
         self.pkg_mac_status: Dict[int, PackagingMachineStatus] = {} # pkg_mac_id, PackagingMachineStatus
 
         # ROS2 client node, maybe unused
@@ -76,6 +76,7 @@ class CoreSystem(Node):
         self.qr_scan_mutex = Lock()
         self.elevator_mutex = Lock()
         self.vision_mutex = Lock()
+        self.jack_up_mutex = Lock()
 
         # Graph of conveyor structure
         self.conveyor = None
@@ -87,10 +88,9 @@ class CoreSystem(Node):
         self.loop_thread.start()
 
         # sync delay, try to avoid it
-        self.dispense_wait = self.create_rate(1.5, self.get_clock())
         self.waiting_result = self.create_rate(1.0, self.get_clock())
 
-        # State of PLC registers
+        # Status of PLC registers
         self.is_plc_connected = False
         self.is_releasing_mtrl_box = False
         self.is_elevator_ready = False
@@ -105,6 +105,7 @@ class CoreSystem(Node):
 
         normal_timer_cbg = MutuallyExclusiveCallbackGroup()
         qr_handle_timer_cbg = MutuallyExclusiveCallbackGroup()
+        jack_up_timer_cbg = MutuallyExclusiveCallbackGroup()
         station_timer_cbgs = [MutuallyExclusiveCallbackGroup() for _ in range(Const.NUM_DISPENSER_STATIONS)]
         self.get_logger().info("Callback groups are created")
 
@@ -155,6 +156,7 @@ class CoreSystem(Node):
         self.order_status_timer = self.create_timer(1.0, self.order_status_cb, callback_group=normal_timer_cbg)
         self.elevator_timer = self.create_timer(1.0, self.elevator_dequeue_cb, callback_group=normal_timer_cbg)
         self.init_vision_timer = self.create_timer(30.0, self.init_vision_cb, callback_group=normal_timer_cbg)
+        self.jack_up_timer = self.create_timer(1.0, self.jack_up_cb, callback_group=jack_up_timer_cbg)
         self.dis_station_timers: Dict[int, rclpy.Timer.Timer] = dict()
         for i in range(1, Const.NUM_DISPENSER_STATIONS + 1):
             cbg_index = int(i - 1)
@@ -339,7 +341,7 @@ class CoreSystem(Node):
             return
         
         with self.qr_scan_mutex:
-            if len(self.qr_scan) == 0:
+            if not self.qr_scan:
                 self.qr_scan.append(msg)
                 self.get_logger().info(f"Camera {msg.camera_id} box [{msg.material_box_id}] is append to qr_scan [Empty]")
             else:
@@ -395,7 +397,7 @@ class CoreSystem(Node):
                 state_changed = True
 
         if state_changed:
-            if len(self.vision_request) > 0:
+            if self.vision_request:
                 self.send_vision_req(self.vision_request.popleft())
             self.get_logger().info(f"Vision block state changed 0 -> 1 at {timestamp}. Queue size: {len(self.vision_request)}")
         elif msg.data != prev_vision_block_state:
@@ -411,19 +413,23 @@ class CoreSystem(Node):
     # Timers callback
     async def start_order_cb(self) -> None:
         with self.mutex:
-            if len(self.elevator_request) > 0:
+            if self.elevator_request:
                 self.get_logger().debug("The material box retrieval have higher priority")
                 return
-            if len(self.recv_order) == 0 or not self.is_plc_connected or self.is_releasing_mtrl_box:
+            if not self.recv_order or not self.is_plc_connected or self.is_releasing_mtrl_box:
                 return
             if self.num_of_mtrl_box_in_container == 0:
                 self.get_logger().error("The material box is zero in container")
                 return
+            if conveyor_seg := self.conveyor.get_conveyor(1): # first conveyor
+                if conveyor_seg.is_occupied:
+                    self.get_logger().error("The first conveyor is occupied")
+                    return
         self.get_logger().info("The received queue stored a order")
 
-        # success = await self.write_registers(5200, [2])
-        future = run_coroutine_threadsafe(self.write_registers(5200, [2]), self.loop)
-        success = future.result()
+        success = self._execute_movement(Const.TRANSFER_MTRL_BOX_ADDR, [2])
+        # run_coroutine_threadsafe(self.write_registers(Const.TRANSFER_MTRL_BOX_ADDR, [2]), self.loop)
+        # success = future.result()
         if success:
             with self.mutex:
                 # order = self.recv_order.popleft()
@@ -479,10 +485,60 @@ class CoreSystem(Node):
     def init_vision_cb(self) -> None:
         self.send_init_vision()
 
+    def jack_up_cb(self) -> None:
+        """
+        Process the jack-up queue and make movement decisions for material boxes.
+        Handles moving items to opposite stations or the next conveyor based on decision logic.
+        """
+        if not self.jack_up_queue:
+            return
+
+        self.get_logger().warning(f"Started decision-making at jack-up point: {len(self.jack_up_queue)}")
+        
+        to_remove = []
+        with self.jack_up_mutex:
+            for order_id, source_station, mtrl_box_id in list(self.jack_up_queue):
+                opposite = Const.STATION_OPPOSITE.get(source_station, [])
+                if not opposite:
+                    self._handle_exit_movement(order_id, source_station, mtrl_box_id, to_remove)
+                    continue
+                
+                decision = self.movement_decision_v1(order_id, opposite)
+                if decision in opposite:
+                    self._handle_opposite_movement(order_id, source_station, mtrl_box_id, decision, to_remove)
+                else:
+                    self._handle_exit_movement(order_id, source_station, mtrl_box_id, to_remove)
+
+        for item in to_remove:
+            self.jack_up_queue.remove(item)
+
+        self.get_logger().warning(f"Handled number of jack-up point: {len(to_remove)}")
+
+    def _handle_exit_movement(self, order_id: int, station_id: int, mtrl_box_id: int, to_remove: list) -> None:
+        success = self._execute_movement(Const.GO_OPPOSITE_ADDR + station_id, Const.EXIT_JACK_UP_VALUE)
+        if success:
+            self.get_logger().warning(f"order_id: {order_id} is moving to next conveyor")
+            to_remove.append((order_id, station_id, mtrl_box_id))
+        else:
+            self.get_logger().error(f"write_registers movement failed")
+
+    def _handle_opposite_movement(self, order_id: int, station_id: int, mtrl_box_id: int, decision: int, to_remove: list) -> None:
+        success = self._execute_movement(Const.GO_OPPOSITE_ADDR + station_id, Const.MOVE_OPPOSITE_VALUE)
+        if success:
+            station = self.conveyor.get_station(decision)
+            curr_conveyor = self.conveyor.get_conveyor_by_station(station_id)
+            if station and curr_conveyor:
+                with self.mutex:
+                    station.occupy(mtrl_box_id)
+                    curr_conveyor.clear()
+                to_remove.append((order_id, station_id, mtrl_box_id))
+        else:
+            self.get_logger().error(f"Failed to write to register {Const.GO_OPPOSITE_ADDR + station_id}")
+
     async def qr_handle_cb(self) -> None:
         with self.qr_scan_mutex:
             self.get_logger().debug(f"len(self.qr_scan): {len(self.qr_scan)}")
-            if len(self.qr_scan) == 0:
+            if not self.qr_scan:
                 return
         
         self.get_logger().info(f"Started to handle the QR scan, Total: {len(self.qr_scan)}")
@@ -564,22 +620,22 @@ class CoreSystem(Node):
         if target_cell >= Const.EXIT_STATION:
             self.get_logger().error(f"The station {station_id} is completed dispense for the material box {mtrl_box_id}")
             success = self.move_out_station(station, station_id, mtrl_box_id)
-            # FIXME: move opposite station if needed 
-            # if success:
-            #     decision = self.movement_decision_v1(order_id, available_stations)
+            if success:
+                with self.jack_up_mutex:
+                    self.jack_up_queue.append((order_id, station_id))
         elif cmd_sliding_platform == 0 or \
              cmd_sliding_platform != curr_sliding_platform or \
              cmd_sliding_platform != target_cell + 1:
             self.get_logger().info(f"station: {station_id} is sending the movement command")
-            # success = await self.write_registers(Const.MOVEMENT_ADDR + station_id, [target_cell + 1])
-            future = run_coroutine_threadsafe(
-                self.write_registers(
-                    Const.MOVEMENT_ADDR + station_id, 
-                    [self.map_index(target_cell + 1)]
-                ), 
-                self.loop
-            )
-            success = future.result()
+            success = self._execute_movement(Const.MOVEMENT_ADDR + station_id, [self.map_index(target_cell + 1)])
+            # run_coroutine_threadsafe(
+            #     self.write_registers(
+            #         Const.MOVEMENT_ADDR + station_id, 
+            #         [self.map_index(target_cell + 1)]
+            #     ), 
+            #     self.loop
+            # )
+            # success = future.result()
             if success:
                 self.get_logger().warning(f"station: {station_id} is moving to {target_cell + 1} cell")
             else:
@@ -662,9 +718,9 @@ class CoreSystem(Node):
         address = Const.MOVEMENT_ADDR + station_id
         values = [self.map_index(cell_no)]
 
-        # success = await self.write_registers(/address, values)
-        future = run_coroutine_threadsafe(self.write_registers(address, values), self.loop)
-        success = future.result()
+        # future = run_coroutine_threadsafe(self.write_registers(address, values), self.loop)
+        # success = future.result()
+        success = self._execute_movement(address, values)
         res.success = success
 
         if success:
@@ -1002,9 +1058,12 @@ class CoreSystem(Node):
         if conveyor_seg and conveyor_seg.is_occupied:
             self.get_logger().info("The conveyor segment is occupied. Try to move out in the next callback")
         else:
-            # success = await self.write_registers(Const.MOVEMENT_ADDR + station_id, [Const.EXIT_STATION])
-            future = run_coroutine_threadsafe(self.write_registers(Const.MOVEMENT_ADDR + station_id, [Const.EXIT_STATION]), self.loop)
-            success = future.result()
+            success = self._execute_movement(Const.MOVEMENT_ADDR + station_id, [Const.EXIT_STATION])
+            # run_coroutine_threadsafe(
+            #     self.write_registers(Const.MOVEMENT_ADDR + station_id, [Const.EXIT_STATION]), 
+            #     self.loop
+            # )
+            # success = future.result()
             if success:
                 with self.mutex:
                     conveyor_seg.occupy(mtrl_box_id)
@@ -1205,9 +1264,9 @@ class CoreSystem(Node):
             # try to move into station
             values = Const.STATION_VALUE_MAP.get(decision)
             self.get_logger().warning(f"Move into station {decision} for camera {camera_id}")
-            # success = await self.write_registers(register_addr, values)
-            future = run_coroutine_threadsafe(self.write_registers(register_addr, values), self.loop)
-            success = future.result()
+            success = self._execute_movement(register_addr, values)
+            # run_coroutine_threadsafe(self.write_registers(register_addr, values), self.loop)
+            # success = future.result()
             if success:
                 station = self.conveyor.get_station(decision)
                 curr_conveyor = self.conveyor.get_conveyor(camera_id)
@@ -1224,9 +1283,9 @@ class CoreSystem(Node):
             self.get_logger().warning(f"Go straight for camera {camera_id}")
             if next_conveyor and not next_conveyor.is_occupied:
                 values = Const.STRAIGHT_VALUE
-                # success = await self.write_registers(register_addr, values)
-                future = run_coroutine_threadsafe(self.write_registers(register_addr, values), self.loop)
-                success = future.result()
+                future = self._execute_movement(register_addr, values)
+                # run_coroutine_threadsafe(self.write_registers(register_addr, values), self.loop)
+                # success = future.result()
                 if success:
                     curr_conveyor = self.conveyor.get_conveyor(camera_id)
                     if curr_conveyor:
@@ -1308,9 +1367,9 @@ class CoreSystem(Node):
             self.get_logger().debug(f"Skipped elevator movement for box {material_box_id} (currently releasing)")
 
         elif not self.is_elevator_ready:
-            # elevator_success = await self.write_registers(5200, [1])
-            future = run_coroutine_threadsafe(self.write_registers(5200, [1]), self.loop)
-            elevator_success = future.result()
+            elevator_success = self._execute_movement(Const.TRANSFER_MTRL_BOX_ADDR, [1])
+            # future = run_coroutine_threadsafe(self.write_registers(Const.TRANSFER_MTRL_BOX_ADDR, [1]), self.loop)
+            # elevator_success = future.result()
             if elevator_success:
                 is_completed = True
                 self.get_logger().warning(f"Sent elevator request successfully")
@@ -1329,7 +1388,7 @@ class CoreSystem(Node):
         return is_completed
     
     def send_init_vision(self)-> Optional[bool]:
-        while not self.init_vision_cli.wait_for_service(timeout_sec=1.0):
+        while not self.init_vision_cli.wait_for_service(timeout_sec=5.0):
             if not rclpy.ok():
                 return None
             self.get_logger().info("init_visual_camera Service not available, waiting again...")
@@ -1581,9 +1640,10 @@ class CoreSystem(Node):
         if address < 0 or count < 0:
             raise ValueError(f"Address ({address}) and count ({count}) must be non-negative")
 
-        req = ReadRegister.Request()
-        req.address = address
-        req.count = count
+        req = ReadRegister.Request(
+            address = address,
+            count = count
+        )
 
         while not self.read_cli.wait_for_service(timeout_sec=1.0):
             if not rclpy.ok():
@@ -1633,9 +1693,10 @@ class CoreSystem(Node):
         if not values:
             raise ValueError("Values list cannot be empty")
         
-        req = WriteRegister.Request()
-        req.address = address
-        req.values = values
+        req = WriteRegister.Request(
+            address = address,
+            values = values
+        )
 
         while not self.write_cli.wait_for_service(timeout_sec=1.0):
             if not rclpy.ok():
@@ -1679,7 +1740,7 @@ class CoreSystem(Node):
             future.add_done_callback(self.vision_goal_response_cb)
             return True
         except Exception as e:
-            self.get_logger().error(f"Failed to write registers at {address}: {str(e)}")
+            self.get_logger().error(f"Failed to send vision request: {str(e)}")
             return False
 
     def init_vision_done_cb(self, future) -> None:
@@ -1697,7 +1758,7 @@ class CoreSystem(Node):
 
         if res and res.success:
             with self.elevator_mutex:   
-                if len(self.elevator_queue) > 0:
+                if self.elevator_queue:
                     self.elevator_queue.popleft()
                     self.get_logger().info(f"Removed from elevator_queue successfully")
 
@@ -1780,10 +1841,21 @@ class CoreSystem(Node):
         result = future.result().result
         status = future.result().status
         if status == GoalStatus.STATUS_SUCCEEDED:
-            self.get_logger().info("Goal succeeded! Result: ")
+            self.get_logger().info("Goal succeeded! Result: Yeah!!")
         else:
-            self.get_logger().info("Goal failed with status: ")
-
+            self.get_logger().info("Goal failed with status: NO!!!")
+    
+    def _execute_movement(self, address: int, values: List[int]) -> Optional[bool]:
+        """Execute a register write operation and return success status."""
+        try:
+            future = run_coroutine_threadsafe(
+                self.write_registers(address, values), 
+                self.loop
+            )
+            return future.result()
+        except Exception as e:
+            self.get_logger().error(f"Movement execution failed: {str(e)}")
+            return False
 
     def map_index(self, index: int) -> int:
         """Maps HKCLR index to Production Line PLC index.

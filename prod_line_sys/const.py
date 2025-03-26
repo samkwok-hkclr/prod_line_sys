@@ -24,7 +24,12 @@ class Const:
     NUM_DISPENSER_STATIONS: Final[int] = 14
 
     MOVEMENT_ADDR: Final[int] = 5000
-    
+    TRANSFER_MTRL_BOX_ADDR: Final[int] = 5200
+    GO_OPPOSITE_ADDR: Final[int] = 5150
+
+    EXIT_JACK_UP_VALUE: Final[int] = [1]
+    MOVE_OPPOSITE_VALUE: Final[int] = [2]
+
     CAMERA_STATION_PLC_MAP: Final[Dict] = {
         1: ([1, 2],   5201),
         2: ([3, 4],   5202),
@@ -52,3 +57,21 @@ class Const:
         13: [2],
         14: [3]
     }
+    STATION_OPPOSITE: Final[Dict] = {
+        1: [2],
+        2: [1],
+        3: [4],
+        4: [3],
+        5: [6],
+        6: [5],
+        7: [], # Not exist
+        8: [], # Not exist
+        9: [10],
+        10: [9],
+        11: [12],
+        12: [11],
+        13: [14],
+        14: [13]
+    }
+    
+
