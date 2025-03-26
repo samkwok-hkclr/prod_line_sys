@@ -1646,7 +1646,7 @@ class CoreSystem(Node):
             self.get_logger().error(f"Service call succeeded but reported failure for dispenser station: {station_id}")
 
     def map_index(self, index: int) -> int:
-        """Maps HKCLR index position to Production Line PLC index.
+        """Maps HKCLR index to Production Line PLC index.
     
         Args:
             index: An integer representing the position (0, EXIT_STATION, or 1-28)
@@ -1667,7 +1667,7 @@ class CoreSystem(Node):
         return (idx // Const.GRID_HEIGHT) + (idx % Const.GRID_HEIGHT) * Const.GRID_WIDTH + 1
     
     def inverse_map_index(self, index: int) -> int:
-        """Maps Production Line PLC index position to HKCLR index.
+        """Maps Production Line PLC index to HKCLR index.
     
         Args:
             index: An integer representing the position (0, EXIT_STATION, or 1-28)

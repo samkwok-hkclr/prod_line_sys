@@ -23,7 +23,6 @@ class Const:
 
     MOVEMENT_ADDR: Final[int] = 5000
     
-    STRAIGHT_VALUE: Final[List] = [1]
     CAMERA_STATION_PLC_MAP: Final[Dict] = {
         1: ([1, 2],   5201),
         2: ([3, 4],   5202),
@@ -34,7 +33,7 @@ class Const:
         7: ([11, 12], 5206),
         8: ([13, 14], 5207)
     }
-    
+    STRAIGHT_VALUE: Final[List] = [1]
     STATION_VALUE_MAP: Final[Dict] = {
         1: [2],
         2: [3],
