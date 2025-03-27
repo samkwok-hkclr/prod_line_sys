@@ -14,7 +14,7 @@ class Const:
     PKG_MAC_ID_START: Final[int] = 1
     PKG_MAC_ID_END: Final[int] = 2
 
-    MAX_MTRL_BOX_IN_CON: Final[int] = 10
+    MAX_MTRL_BOX_IN_CON: Final[int] = 20
 
     GO_STRAIGHT: Final[int] = 0
     
