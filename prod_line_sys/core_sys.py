@@ -18,7 +18,7 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallb
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 
 from action_msgs.msg import GoalStatus
-from std_msgs.msg import Bool, UInt8MultiArray
+from std_msgs.msg import Bool, UInt8, UInt8MultiArray
 from std_srvs.srv import Trigger
 
 from smdps_msgs.action import VisualDetection
@@ -41,7 +41,7 @@ from smdps_msgs.srv import (NewOrder,
                             MoveSlidingPlatform, 
                             DispenseDrug, 
                             PackagingOrder,
-                            UInt8)
+                            UInt8 as UInt8Srv)
 
 from .dispenser_station import DispenserStation
 from .conveyor_segment import ConveyorSegment
@@ -73,6 +73,7 @@ class CoreSystem(Node):
 
         # mutex
         self.mutex = Lock()
+        self.occupy_mutex = Lock()
         self.qr_scan_mutex = Lock()
         self.elevator_mutex = Lock()
         self.vision_mutex = Lock()
@@ -123,7 +124,7 @@ class CoreSystem(Node):
         self.qr_scan_sub = self.create_subscription(CameraTrigger, "qr_camera_scan", self.qr_scan_cb, 10, callback_group=sub_cbg)
         self.pkg_mac_status_sub = self.create_subscription(PackagingMachineStatus, "packaging_machine_status", self.pkg_mac_status_cb, 10, callback_group=sub_cbg)
         self.vision_block_sub = self.create_subscription(Bool, "vision_block", self.vision_block_cb, 10, callback_group=sub_cbg)
-        self.con_mtrl_box_sub = self.create_subscription(Bool, "container_material_box", self.con_mtrl_box_cb, 10, callback_group=sub_cbg)
+        self.con_mtrl_box_sub = self.create_subscription(UInt8, "container_material_box", self.con_mtrl_box_cb, 10, callback_group=sub_cbg)
         self.get_logger().info("Subscriptions are created")
         
         # Service servers
@@ -135,8 +136,8 @@ class CoreSystem(Node):
         self.read_cli = self.create_client(ReadRegister, "read_register", callback_group=srv_cli_cbg)
         self.write_cli = self.create_client(WriteRegister, "write_register", callback_group=srv_cli_cbg)
         self.init_vision_cli = self.create_client(Trigger, "init_visual_camera", callback_group=srv_cli_cbg)
-        self.income_mtrl_box_cli = self.create_client(UInt8, "income_material_box", callback_group=srv_cli_cbg)
-        self.con_mtrl_box_cli = self.create_client(UInt8, "container_material_box", callback_group=srv_cli_cbg)
+        self.income_mtrl_box_cli = self.create_client(UInt8Srv, "income_material_box", callback_group=srv_cli_cbg)
+        self.con_mtrl_box_cli = self.create_client(UInt8Srv, "container_material_box", callback_group=srv_cli_cbg)
         self.rel_blocking_cli = self.create_client(Trigger, "release_blocking", callback_group=srv_cli_cbg)
         self.pkg_order_cli = self.create_client(PackagingOrder, "packaging_order", callback_group=srv_cli_cbg)
         self.dis_station_clis: Dict[int, rclpy.client.Client] = dict() # station_id, Client
@@ -155,7 +156,7 @@ class CoreSystem(Node):
         self.start_order_timer = self.create_timer(1.0, self.start_order_cb, callback_group=normal_timer_cbg)
         self.order_status_timer = self.create_timer(1.0, self.order_status_cb, callback_group=normal_timer_cbg)
         self.elevator_timer = self.create_timer(1.0, self.elevator_dequeue_cb, callback_group=normal_timer_cbg)
-        self.init_vision_timer = self.create_timer(30.0, self.init_vision_cb, callback_group=normal_timer_cbg)
+        # self.init_vision_timer = self.create_timer(30.0, self.init_vision_cb, callback_group=normal_timer_cbg)
         self.jack_up_timer = self.create_timer(1.0, self.jack_up_cb, callback_group=jack_up_timer_cbg)
         self.dis_station_timers: Dict[int, rclpy.Timer.Timer] = dict()
         for i in range(1, Const.NUM_DISPENSER_STATIONS + 1):
@@ -397,8 +398,8 @@ class CoreSystem(Node):
                 state_changed = True
 
         if state_changed:
-            if self.vision_request:
-                self.send_vision_req(self.vision_request.popleft())
+            # if self.vision_request:
+            #     self.send_vision_req(self.vision_request.popleft())
             self.get_logger().info(f"Vision block state changed 0 -> 1 at {timestamp}. Queue size: {len(self.vision_request)}")
         elif msg.data != prev_vision_block_state:
             self.get_logger().debug(f"EleVision blockvator state changed 1 -> 0. Queue size: {len(self.vision_request)}")
@@ -407,8 +408,10 @@ class CoreSystem(Node):
         if not (0 <= msg.data <= Const.MAX_MTRL_BOX_IN_CON):
             self.get_logger().error(f"Invalid number of material box in container: {msg.data}")
             return
+
         with self.mutex:
             self.num_of_mtrl_box_in_container = msg.data
+            self.get_logger().debug(f"number of material box in container: {self.num_of_mtrl_box_in_container}")
 
     # Timers callback
     async def start_order_cb(self) -> None:
@@ -418,9 +421,9 @@ class CoreSystem(Node):
                 return
             if not self.recv_order or not self.is_plc_connected or self.is_releasing_mtrl_box:
                 return
-            if self.num_of_mtrl_box_in_container == 0:
-                self.get_logger().error("The material box is zero in container")
-                return
+            # if self.num_of_mtrl_box_in_container == 0:
+            #     self.get_logger().error(f"The material box is zero in container: {self.num_of_mtrl_box_in_container}")
+            #     return
             if conveyor_seg := self.conveyor.get_conveyor(1): # first conveyor
                 if conveyor_seg.is_occupied:
                     self.get_logger().error("The first conveyor is occupied")
@@ -528,9 +531,22 @@ class CoreSystem(Node):
             station = self.conveyor.get_station(decision)
             curr_conveyor = self.conveyor.get_conveyor_by_station(station_id)
             if station and curr_conveyor:
-                with self.mutex:
+                try:
+                    acquired = self.occupy_mutex.acquire(timeout=1.0)
+                    if not acquired:
+                        self.get_logger().error("Failed to acquire mutex for status update")
+                        return
                     station.occupy(mtrl_box_id)
                     curr_conveyor.clear()
+                    
+                except Exception as e:
+                    self.get_logger().error(f"Error in _handle_opposite_movement: {str(e)}")
+                finally:
+                    if self.occupy_mutex.locked():
+                        self.occupy_mutex.release()
+
+                self.get_logger().error(f">>>>> Station Occupied: {station.id} by material box: {mtrl_box_id}")
+                self.get_logger().error(f">>>>> Conveyor Released: {curr_conveyor.id}")
                 to_remove.append((order_id, station_id, mtrl_box_id))
         else:
             self.get_logger().error(f"Failed to write to register {Const.GO_OPPOSITE_ADDR + station_id}")
@@ -569,11 +585,11 @@ class CoreSystem(Node):
                     else:
                         is_completed = await self.camera_1_to_9_action(order_id, material_box_id, camera_id) 
                 case 9: # vision inspection
-                    is_completed = await self.camera_9_action(order_id, material_box_id)  
+                    is_completed = await self.camera_9_action(order_id, material_box_id, camera_id)  
                 case 10: # packaging machine 1
-                    is_completed = await self.camera_10_action(order_id, material_box_id)      
+                    is_completed = await self.camera_10_action(order_id, material_box_id, camera_id)      
                 case 11: # packaging machine 2
-                    is_completed = await self.camera_11_action(order_id, material_box_id)      
+                    is_completed = await self.camera_11_action(order_id, material_box_id, camera_id)      
                 case _:
                     self.get_logger().info(f"Received unknown camera ID: {camera_id}")
                 
@@ -619,10 +635,10 @@ class CoreSystem(Node):
 
         if target_cell >= Const.EXIT_STATION:
             self.get_logger().error(f"The station {station_id} is completed dispense for the material box {mtrl_box_id}")
-            success = self.move_out_station(station, station_id, mtrl_box_id)
+            success = await self.move_out_station(station, station_id, mtrl_box_id)
             if success:
                 with self.jack_up_mutex:
-                    self.jack_up_queue.append((order_id, station_id))
+                    self.jack_up_queue.append((order_id, station_id, mtrl_box_id))
         elif cmd_sliding_platform == 0 or \
              cmd_sliding_platform != curr_sliding_platform or \
              cmd_sliding_platform != target_cell + 1:
@@ -1065,9 +1081,21 @@ class CoreSystem(Node):
             # )
             # success = future.result()
             if success:
-                with self.mutex:
+                try:
+                    acquired = self.occupy_mutex.acquire(timeout=1.0)
+                    if not acquired:
+                        self.get_logger().error("Failed to acquire mutex for occupy")
+                        return False
                     conveyor_seg.occupy(mtrl_box_id)
                     station.clear()
+                except Exception as e:
+                    self.get_logger().error(f"Error in move_out_station: {str(e)}")
+                finally:
+                    if self.occupy_mutex.locked():
+                        self.occupy_mutex.release()
+
+                self.get_logger().error(f">>>>> Conveyor Occupied: {conveyor_seg.id} by material box: {mtrl_box_id}")
+                self.get_logger().error(f">>>>> Station Released: {station.id}")
                 return True
             
             self.get_logger().info(f"Failed to move out material box [{mtrl_box_id}] in station [{station_id}]")
@@ -1271,9 +1299,22 @@ class CoreSystem(Node):
                 station = self.conveyor.get_station(decision)
                 curr_conveyor = self.conveyor.get_conveyor(camera_id)
                 if station and curr_conveyor:
-                    with self.mutex:
+                    
+                    try:
+                        acquired = self.occupy_mutex.acquire(timeout=1.0)
+                        if not acquired:
+                            self.get_logger().error("Failed to acquire mutex for occupy")
+                            return False
                         station.occupy(material_box_id)
                         curr_conveyor.clear()
+                    except Exception as e:
+                        self.get_logger().error(f"Error in camera_1_to_9_action 1: {str(e)}")
+                    finally:
+                        if self.occupy_mutex.locked():
+                            self.occupy_mutex.release()
+
+                    self.get_logger().error(f">>>>> Station Occupied: {station.id} by material box: {material_box_id}")
+                    self.get_logger().error(f">>>>> Conveyor Released: {curr_conveyor.id}")
                     is_completed = True
             else:
                 self.get_logger().error(f"Failed to write to register {register_addr}")
@@ -1283,15 +1324,27 @@ class CoreSystem(Node):
             self.get_logger().warning(f"Go straight for camera {camera_id}")
             if next_conveyor and not next_conveyor.is_occupied:
                 values = Const.STRAIGHT_VALUE
-                future = self._execute_movement(register_addr, values)
+                success = self._execute_movement(register_addr, values)
                 # run_coroutine_threadsafe(self.write_registers(register_addr, values), self.loop)
                 # success = future.result()
                 if success:
                     curr_conveyor = self.conveyor.get_conveyor(camera_id)
                     if curr_conveyor:
-                        with self.mutex:
+                        try:
+                            acquired = self.occupy_mutex.acquire(timeout=1.0)
+                            if not acquired:
+                                self.get_logger().error("Failed to acquire mutex for occupy")
+                                return False
                             next_conveyor.occupy(material_box_id)
                             curr_conveyor.clear()
+                        except Exception as e:
+                            self.get_logger().error(f"Error in camera_1_to_9_action 2: {str(e)}")
+                        finally:
+                            if self.occupy_mutex.locked():
+                                self.occupy_mutex.release()
+        
+                        self.get_logger().error(f">>>>> Conveyor Occupied: {next_conveyor.id} by material box: {material_box_id}")
+                        self.get_logger().error(f">>>>> Conveyor Released: {curr_conveyor.id}")
                         is_completed = True
                 else:
                     self.get_logger().error(f"Failed to write to register {register_addr}")
@@ -1301,7 +1354,7 @@ class CoreSystem(Node):
         self.get_logger().warning(f"decision [{decision}] / {station_ids} is made for material box [{material_box_id}] in camera [{camera_id}]")
         return is_completed
     
-    async def camera_9_action(self, order_id: int, material_box_id: int) -> Optional[bool]:
+    async def camera_9_action(self, order_id: int, material_box_id: int, camera_id: int) -> Optional[bool]:
         is_completed = True
         
         # FIXME: Wait the vision system complete
@@ -1309,10 +1362,32 @@ class CoreSystem(Node):
         # if len(remainder) == 0:
         #     self.vision_request.append(order_id)
 
+        curr_conveyor = self.conveyor.get_conveyor(camera_id)
+        next_conveyor = self.conveyor.get_next_conveyor(camera_id)
+        self.get_logger().warning(f"Go straight for camera {camera_id}")
+        if curr_conveyor and next_conveyor and not next_conveyor.is_occupied:
+            try:
+                acquired = self.occupy_mutex.acquire(timeout=1.0)
+                if not acquired:
+                    self.get_logger().error("Failed to acquire mutex for occupy")
+                    return
+                next_conveyor.occupy(material_box_id)
+                curr_conveyor.clear()
+            except Exception as e:
+                self.get_logger().error(f"Error in camera_1_to_9_action 2: {str(e)}")
+            finally:
+                if self.occupy_mutex.locked():
+                    self.occupy_mutex.release()
+
+            self.get_logger().error(f">>>>> Conveyor Occupied: {next_conveyor.id} by material box: {material_box_id}")
+            self.get_logger().error(f">>>>> Conveyor Released: {curr_conveyor.id}")
+        else:
+            self.get_logger().warning(f"The next conveyor is unavailable for camera [{camera_id}]")
+
         self.get_logger().info(f"Vision inspection triggered for material box [{material_box_id}]")
         return is_completed
         
-    async def camera_10_action(self, order_id: int, material_box_id: int) -> Optional[bool]:
+    async def camera_10_action(self, order_id: int, material_box_id: int, camera_id: int) -> Optional[bool]:
         """
         Process operations for camera 10 for a given order and material box.
         
@@ -1323,6 +1398,29 @@ class CoreSystem(Node):
         Returns:
             bool: True if operation completed successfully, False otherwise
         """
+
+        curr_conveyor = self.conveyor.get_conveyor(camera_id)
+        next_conveyor = self.conveyor.get_next_conveyor(camera_id)
+        self.get_logger().warning(f"Go straight for camera {camera_id}")
+        if curr_conveyor and next_conveyor and not next_conveyor.is_occupied:
+            try:
+                acquired = self.occupy_mutex.acquire(timeout=1.0)
+                if not acquired:
+                    self.get_logger().error("Failed to acquire mutex for occupy")
+                    return False
+                next_conveyor.occupy(material_box_id)
+                curr_conveyor.clear()
+            except Exception as e:
+                self.get_logger().error(f"Error in camera_1_to_9_action 2: {str(e)}")
+            finally:
+                if self.occupy_mutex.locked():
+                    self.occupy_mutex.release()
+
+            self.get_logger().error(f">>>>> Conveyor Occupied: {next_conveyor.id} by material box: {material_box_id}")
+            self.get_logger().error(f">>>>> Conveyor Released: {curr_conveyor.id}")
+        else:
+            self.get_logger().warning(f"The next conveyor is unavailable for camera [{camera_id}]")
+
         is_completed = False
 
         # FIXME: No need to find reminder if vision inspiration is done
@@ -1348,7 +1446,7 @@ class CoreSystem(Node):
         self.get_logger().info(f"Packaging machine 1 triggered for material box [{material_box_id}]")    
         return is_completed
     
-    async def camera_11_action(self, order_id: int, material_box_id: int) -> Optional[bool]:
+    async def camera_11_action(self, order_id: int, material_box_id: int, camera_id: int) -> Optional[bool]:
         """
         Process operations for camera 11 for a given order and material box.
         
@@ -1359,6 +1457,26 @@ class CoreSystem(Node):
         Returns:
             bool: True if operation completed successfully, False otherwise
         """
+
+        curr_conveyor = self.conveyor.get_conveyor(camera_id)
+        self.get_logger().warning(f"Go straight for camera {camera_id}")
+        if curr_conveyor:
+            try:
+                acquired = self.occupy_mutex.acquire(timeout=1.0)
+                if not acquired:
+                    self.get_logger().error("Failed to acquire mutex for occupy")
+                    return False
+                curr_conveyor.clear()
+            except Exception as e:
+                self.get_logger().error(f"Error in camera_1_to_9_action 2: {str(e)}")
+            finally:
+                if self.occupy_mutex.locked():
+                    self.occupy_mutex.release()
+
+            self.get_logger().error(f">>>>> Conveyor Released: {curr_conveyor.id}")
+        else:
+            self.get_logger().warning(f"The next conveyor is unavailable for camera [{camera_id}]")
+
         is_completed = False
 
         elevator_success = False
@@ -1446,7 +1564,7 @@ class CoreSystem(Node):
         if mtrl_box_id < 0:
             raise ValueError(f"Material box ID must be non-negative, got {mtrl_box_id}")
         
-        req = UInt8.Request()
+        req = UInt8Srv.Request()
         req.data = mtrl_box_id
 
         while not self.income_mtrl_box_cli.wait_for_service(timeout_sec=1.0):
@@ -1572,7 +1690,7 @@ class CoreSystem(Node):
         if mtrl_box_id < 0:
             raise ValueError(f"Material box ID must be non-negative, got {mtrl_box_id}")
         
-        req = UInt8.Request()
+        req = UInt8Srv.Request()
         req.data = mtrl_box_id
 
         while not self.con_mtrl_box_cli.wait_for_service(timeout_sec=1.0):

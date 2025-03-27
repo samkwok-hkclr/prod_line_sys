@@ -36,7 +36,8 @@ class NewOrderActionServer(Node):
         # Callback groups
         sub_cbg = MutuallyExclusiveCallbackGroup()
         srv_cli_cbg = MutuallyExclusiveCallbackGroup()
-        action_ser_cbg = ReentrantCallbackGroup()
+        # action_ser_cbg = ReentrantCallbackGroup()
+        action_ser_cbg = MutuallyExclusiveCallbackGroup()
 
         normal_timer_cbg = MutuallyExclusiveCallbackGroup()
 
@@ -61,7 +62,8 @@ class NewOrderActionServer(Node):
             goal_callback=self.goal_cb,
             cancel_callback=self.cancel_cb,
             execute_callback=self.execute_cb,
-            callback_group=action_ser_cbg
+            callback_group=action_ser_cbg,
+            result_timeout=60
         )
 
         # Timers
@@ -174,8 +176,6 @@ class NewOrderActionServer(Node):
     async def execute_cb(self, goal_handle):
         """Execute a goal for the NewOrderAction."""
         try:
-            self.get_logger().info(f"goal_handle: {type(goal_handle)}")
-
             goal = goal_handle.request
             req = goal.request
             result = NewOrderAction.Result()
@@ -238,6 +238,7 @@ class NewOrderActionServer(Node):
             with self._status_lock:
                 if self.mtrl_box_status.get(order_id):
                     self.mtrl_box_status.pop(order_id)
+
                 if self.order_sent.get(order_id):
                     self.order_sent.pop(order_id)
 
