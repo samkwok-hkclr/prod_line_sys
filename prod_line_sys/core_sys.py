@@ -88,7 +88,7 @@ class CoreSystem(Node):
         self.loop_thread = Thread(target=self.run_loop, daemon=True)
         self.loop_thread.start()
 
-        # sync delay, try to avoid it
+        # sync delay, try to avoid to use it
         self.waiting_result = self.create_rate(1.0, self.get_clock())
 
         # Status of PLC registers
@@ -125,6 +125,7 @@ class CoreSystem(Node):
         self.pkg_mac_status_sub = self.create_subscription(PackagingMachineStatus, "packaging_machine_status", self.pkg_mac_status_cb, 10, callback_group=sub_cbg)
         self.vision_block_sub = self.create_subscription(Bool, "vision_block", self.vision_block_cb, 10, callback_group=sub_cbg)
         self.con_mtrl_box_sub = self.create_subscription(UInt8, "container_material_box", self.con_mtrl_box_cb, 10, callback_group=sub_cbg)
+        self.loc_sensor_sub = self.create_subscription(UInt8MultiArray, "location_sensor", self.loc_sensor_cb, 10, callback_group=sub_cbg)
         self.get_logger().info("Subscriptions are created")
         
         # Service servers
@@ -375,7 +376,7 @@ class CoreSystem(Node):
             self.get_logger().error(f"Invalid packaging_machine_id type: {type(machine_id).__name__}")
             return
         if machine_id not in (Const.PKG_MAC_ID_START, Const.PKG_MAC_ID_END):
-            self.get_logger().warning(f"Ignoring status update for unknown machine ID {machine_id}")
+            self.get_logger().error(f"Ignoring status update for unknown machine ID {machine_id}")
             return
         
         with self.mutex:
@@ -416,6 +417,9 @@ class CoreSystem(Node):
             self.num_of_mtrl_box_in_container = msg.data
             self.get_logger().debug(f"number of material box in container: {self.num_of_mtrl_box_in_container}")
 
+    def loc_sensor_cb(self, msg: UInt8MultiArray) -> None:
+        pass
+
     # Timers callback
     async def start_order_cb(self) -> None:
         with self.mutex:
@@ -435,9 +439,9 @@ class CoreSystem(Node):
 
         success = self._execute_movement(Const.TRANSFER_MTRL_BOX_ADDR, [2])
         if success:
+            with self.occupy_mutex:
+                conveyor_seg.occupy(-1) # FIXME: do not know the material box id
             with self.mutex:
-                conveyor_seg.occupy(-1)
-
                 highest_priority_order = max(self.recv_order, key=lambda _order: _order.priority)
                 self.proc_order[highest_priority_order.order_id] = deepcopy(highest_priority_order)
                 status = self.mtrl_box_status.get(highest_priority_order.order_id)
@@ -522,6 +526,7 @@ class CoreSystem(Node):
             if not acquired:
                 self.get_logger().error("Failed to acquire mutex for status update")
                 return
+            
             if conveyor and station and not conveyor.is_occupied:
                 success = self._execute_movement(Const.GO_OPPOSITE_ADDR + station_id, Const.EXIT_JACK_UP_VALUE)
                 if success:
@@ -590,13 +595,13 @@ class CoreSystem(Node):
 
             self.get_logger().info(f"Start to handle camera: {camera_id}")
             match camera_id:
-                case 1: # QR scanner
+                case 1: # QR camera
                     camera_1_result = self.camera_1_action(order_id, material_box_id)
                     order_id = self.get_order_id_by_mtrl_box(material_box_id)
                     if camera_1_result:
                         continue
                     is_completed = await self.camera_1_to_9_action(order_id, material_box_id, camera_id) 
-                case 2 | 3 | 4 | 5 | 6 | 7 | 8: # QR scanner
+                case 2 | 3 | 4 | 5 | 6 | 7 | 8: # QR camera
                     if order_id is None:
                         self.get_logger().info(f"The scan maybe incorrect cameras: {msg.camera_id}, box: {msg.material_box_id} ")
                         is_completed = True
@@ -870,7 +875,6 @@ class CoreSystem(Node):
             if self.mutex.locked():
                 self.mutex.release()
     
-    # TODO: find the highest priority order request
     def bind_mtrl_box(self, material_box_id: int) -> Optional[int]:
         """
         Bind a material box to an available order.
@@ -941,11 +945,8 @@ class CoreSystem(Node):
             status = self.mtrl_box_status.get(order_id)
             proc = self.proc_order.get(order_id)
             
-            # if status is None or proc is None:
-            #     raise KeyError(f"Order ID {order_id} not found")
             if status is None or proc is None:
                 self.get_logger().error(f"Order ID {order_id} not found in status or process data")
-                # return None
                 raise KeyError(f"Order ID {order_id} not found")
             
             # Track existing dispenser stations in current material box
@@ -1182,10 +1183,7 @@ class CoreSystem(Node):
             # self.get_logger().warning(f"Debug: force to move out Station [{station_id}]")
         except ValueError:
             target_cell = Const.EXIT_STATION
-
-        if target_cell == Const.EXIT_STATION:
-            return None, Const.EXIT_STATION
-
+            
         filtered_missing = None
         try:
             while target_cell < Const.CELLS:
@@ -1219,7 +1217,6 @@ class CoreSystem(Node):
                     if any(item[0] == station_id for item in lst)  # Skip lists with no matching station_id
                 ]
                 self.get_logger().debug(f"filtered_missing: {filtered_missing}")
-
                 self.get_logger().warning(f"Cell {target_cell}: required={required}, curr={curr}, missing at station {station_id}={filtered_missing}")
 
                 if filtered_missing:
@@ -1984,7 +1981,7 @@ class CoreSystem(Node):
             ValueError: If index is not 0, EXIT_STATION, or between 1 and 28
         """
         if index == 0:
-            return 0
+            return index
         if index == Const.EXIT_STATION:
             return index
         if not (1 <= index <= Const.CELLS):
@@ -2005,7 +2002,7 @@ class CoreSystem(Node):
             ValueError: If index is not 0, EXIT_STATION, or between 1 and 28
         """
         if index == 0:
-            return 0
+            return index
         if index == Const.EXIT_STATION:
             return index
         if not (1 <= index <= Const.CELLS):

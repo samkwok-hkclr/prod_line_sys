@@ -2,6 +2,10 @@ from .dispenser_station import DispenserStation
 from .conveyor_segment import ConveyorSegment
 from typing import Optional
 
+"""
+The class is the conveyor object of production line
+"""
+
 class Conveyor:
     def __init__(self):
         self.head = None
