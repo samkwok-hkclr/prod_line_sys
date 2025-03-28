@@ -500,26 +500,29 @@ class CoreSystem(Node):
         
         to_remove = []
         with self.jack_up_mutex:
-            for order_id, source_station, mtrl_box_id in list(self.jack_up_queue):
-                opposite = Const.STATION_OPPOSITE.get(source_station, [])
+            for order_id, source_station_id, mtrl_box_id in list(self.jack_up_queue):
+                opposite = Const.STATION_OPPOSITE.get(source_station_id, [])
                 if not opposite:
-                    self._handle_exit_movement(order_id, source_station, mtrl_box_id, to_remove)
+                    self.get_logger().warning(f"order_id: {order_id} should be leave")
+                    self._handle_exit_movement(order_id, source_station_id, mtrl_box_id, to_remove)
                     continue
                 
-                decision = self.movement_decision_v1(order_id, opposite)
-                if decision in opposite:
-                    self._handle_opposite_movement(order_id, source_station, mtrl_box_id, decision, to_remove)
+                decided_station_id = self.movement_decision_v1(order_id, opposite)
+                if decided_station_id in opposite:
+                    self.get_logger().warning(f"order_id: {order_id} should be move to opposite station")
+                    self._handle_opposite_movement(order_id, source_station_id, mtrl_box_id, decided_station_id, to_remove)
                 else:
-                    self._handle_exit_movement(order_id, source_station, mtrl_box_id, to_remove)
+                    self.get_logger().warning(f"order_id: {order_id} should be leave because opposite station is occupied")
+                    self._handle_exit_movement(order_id, source_station_id, mtrl_box_id, to_remove)
 
-            for item in to_remove:
-                self.jack_up_queue.remove(item)
+        for item in to_remove:
+            self.jack_up_queue.remove(item)
 
         self.get_logger().debug(f"Handled number of jack-up point: {len(to_remove)}")
 
-    def _handle_exit_movement(self, order_id: int, station_id: int, mtrl_box_id: int, to_remove: list) -> None:
-        conveyor = self.conveyor.get_conveyor_by_station(station_id)
-        station = self.conveyor.get_station(station_id)
+    def _handle_exit_movement(self, order_id: int, source_station_id: int, mtrl_box_id: int, to_remove: list) -> None:
+        conveyor = self.conveyor.get_conveyor_by_station(source_station_id)
+        station = self.conveyor.get_station(source_station_id)
 
         try:
             acquired = self.occupy_mutex.acquire(timeout=1.0)
@@ -528,26 +531,26 @@ class CoreSystem(Node):
                 return
             
             if conveyor and station and not conveyor.is_occupied:
-                success = self._execute_movement(Const.GO_OPPOSITE_ADDR + station_id, Const.EXIT_JACK_UP_VALUE)
+                success = self._execute_movement(Const.GO_OPPOSITE_ADDR + source_station_id, Const.EXIT_JACK_UP_VALUE)
                 if success:
                     conveyor.occupy(mtrl_box_id)
                     station.clear()
 
                     self.get_logger().error(f">>>>> Conveyor Occupied: {station.id} by material box: {mtrl_box_id}")
                     self.get_logger().error(f">>>>> Station Released: {conveyor.id}")
-                    to_remove.append((order_id, station_id, mtrl_box_id))
+                    to_remove.append((order_id, source_station_id, mtrl_box_id))
                 else:
                     self.get_logger().error(f"write_registers movement failed")
         except Exception as e:
-            self.get_logger().error(f"Error in _handle_opposite_movement: {str(e)}")
+            self.get_logger().error(f"Error in _handle_exit_movement: {str(e)}")
         finally:
             if self.occupy_mutex.locked():
                 self.occupy_mutex.release()
 
-    def _handle_opposite_movement(self, order_id: int, station_id: int, mtrl_box_id: int, decision: int, to_remove: list) -> None:
-        target_station = self.conveyor.get_station(decision)
-        conveyor = self.conveyor.get_conveyor_by_station(station_id)
-        station = self.conveyor.get_station(station_id)
+    def _handle_opposite_movement(self, order_id: int, source_station_id: int, mtrl_box_id: int, decided_station_id: int, to_remove: list) -> None:
+        target_station = self.conveyor.get_station(decided_station_id)
+        conveyor = self.conveyor.get_conveyor_by_station(source_station_id)
+        source_station = self.conveyor.get_station(source_station_id)
 
         try:
             acquired = self.occupy_mutex.acquire(timeout=1.0)
@@ -555,19 +558,19 @@ class CoreSystem(Node):
                 self.get_logger().error("Failed to acquire mutex for status update")
                 return
             
-            if target_station and conveyor and station and not conveyor.is_occupied and not target_station.is_occupied:
-                success = self._execute_movement(Const.GO_OPPOSITE_ADDR + station_id, Const.MOVE_OPPOSITE_VALUE)
+            if target_station and conveyor and source_station and not conveyor.is_occupied and not target_station.is_occupied:
+                success = self._execute_movement(Const.GO_OPPOSITE_ADDR + source_station_id, Const.MOVE_OPPOSITE_VALUE)
                 if success:
                     target_station.occupy(mtrl_box_id)
                     # FIXME: should this used?
                     # conveyor.occupy(mtrl_box_id) 
-                    station.clear()
+                    source_station.clear()
 
-                    self.get_logger().error(f">>>>> Station Occupied: {station.id} by material box: {mtrl_box_id}")
+                    self.get_logger().error(f">>>>> Station Occupied: {source_station.id} by material box: {mtrl_box_id}")
                     self.get_logger().error(f">>>>> Conveyor Released: {conveyor.id}")
-                    to_remove.append((order_id, station_id, mtrl_box_id))
+                    to_remove.append((order_id, source_station_id, mtrl_box_id))
                 else:
-                    self.get_logger().error(f"Failed to write to register {Const.GO_OPPOSITE_ADDR + station_id}")
+                    self.get_logger().error(f"Failed to write to register {Const.GO_OPPOSITE_ADDR + source_station_id}")
         except Exception as e:
             self.get_logger().error(f"Error in _handle_opposite_movement: {str(e)}")
         finally:
