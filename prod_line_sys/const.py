@@ -27,8 +27,12 @@ class Const:
     TRANSFER_MTRL_BOX_ADDR: Final[int] = 5200
     GO_OPPOSITE_ADDR: Final[int] = 5150
 
-    EXIT_JACK_UP_VALUE: Final[int] = [1]
-    MOVE_OPPOSITE_VALUE: Final[int] = [2]
+    EXIT_JACK_UP_VALUE: Final[List] = [1]
+    MOVE_OPPOSITE_VALUE: Final[List] = [2]
+    
+    MTRL_BOX_RETRIEVAL_PLC_VALUES: Final[List] = [1]
+    MTRL_BOX_RELEASE_PLC_VALUES: Final[List] = [2]
+    MTRL_BOX_BYPASS_PLC_VALUES: Final[List] = [3]
 
     CAMERA_STATION_PLC_MAP: Final[Dict] = {
         1: ([1, 2],   5201),
@@ -72,6 +76,38 @@ class Const:
         12: [11],
         13: [14],
         14: [13]
+    }
+
+    SENSOR_LENGTH: Final[int] = 77
+    CONTAINER_SENSOR: Final[Dict] = {
+        1: range(0, 1)
+    }
+    STATION_SENSOR: Final[Dict] = {
+        1: range(7, 10),
+        2: range(4, 7),
+        3: range(16, 19),
+        4: range(13, 16),
+        5: range(25, 28),
+        6: range(22, 25),
+        7: range(31, 34),
+        8: range(44, 47),
+        9: range(53, 56),
+        10: range(50, 53),
+        11: range(62, 65),
+        12: range(59, 62),
+        13: range(71, 74),
+        14: range(68, 71),
+    }
+    CONVEYOR_SENSOR: Final[Dict] = {
+        1: range(1, 4),
+        2: range(10, 13),
+        3: range(19, 22),
+        4: range(28, 31),
+        5: range(34, 44),
+        6: range(47, 50),
+        7: range(56, 59),
+        8: range(65, 68),
+        9: range(74, 77)
     }
     
 

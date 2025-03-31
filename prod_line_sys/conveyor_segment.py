@@ -7,6 +7,7 @@ class ConveyorSegment:
         self.id: int = id
         self._curr_mtrl_box: int = 0
         self._is_occupied: bool = False
+        self._is_free: bool = True
         self.l_station: DispenserStation = l_station
         self.r_station: DispenserStation = r_station
         self.next = None
@@ -25,6 +26,11 @@ class ConveyorSegment:
         with self.mutex:
             self._curr_mtrl_box = mtrl_box_id
             self._is_occupied = True
+
+    def available(self) -> bool:
+        if not self._is_occupied and self._is_free:
+            return True
+        return False
 
     @property
     def curr_mtrl_box(self):
@@ -49,6 +55,18 @@ class ConveyorSegment:
             raise TypeError(f"Expected boolean for is_occupied, got {type(value).__name__}")
         with self.mutex:
             self._is_occupied = value 
+
+    @property
+    def is_free(self):
+        with self.mutex:
+            return self._is_free
+    
+    @is_free.setter
+    def is_free(self, value):
+        if not isinstance(value, bool):
+            raise TypeError(f"Expected boolean for is_free, got {type(value).__name__}")
+        with self.mutex:
+            self._is_free = value 
 
     def __str__(self):
         return f"Conveyor id:{self.id}, box:{self.curr_mtrl_box}, occupied:{self.is_occupied}"

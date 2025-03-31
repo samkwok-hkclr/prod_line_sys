@@ -95,6 +95,21 @@ class Conveyor:
         
         return None
     
+    def get_next_conveyor_by_station(self, station_id: int) -> Optional[ConveyorSegment]:
+        """Return the ConveyorSegment that the station attached to"""
+        if not self.head:
+            return None
+        
+        curr_node = self.head
+        while curr_node:
+            if curr_node.l_station and curr_node.l_station.id == station_id:
+                return curr_node.next
+            if curr_node.r_station and curr_node.r_station.id == station_id:
+                return curr_node.next
+            curr_node = curr_node.next
+        
+        return None
+    
     def get_next_conveyor(self, conveyor_id: int) -> Optional[ConveyorSegment]:
         """Return the ConveyorSegment that comes after the segment with the specified id,
         or None if not found or if it's the last segment"""
