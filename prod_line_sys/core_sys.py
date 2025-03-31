@@ -1,10 +1,10 @@
 import sys
 import time
 import asyncio
-from asyncio import coroutine, run, run_coroutine_threadsafe
+from asyncio import run_coroutine_threadsafe
 from collections import deque
 from threading import Thread, Lock, Condition
-from typing import Dict, List, Set, Tuple, Optional
+from typing import Dict, List, Set, Tuple, Optional, Final
 from array import array
 from copy import deepcopy
 from datetime import datetime, timedelta
@@ -52,7 +52,9 @@ class CoreSystem(Node):
     def __init__(self, executor):
         super().__init__("core_system_node")
         self.exec = executor
-        
+
+        self.MUTEX_TIMEOUT: Final[float] = 1.0
+
         # FIXME: try to save in database later
         # Local memory storage, 
         self.recv_order = deque()
@@ -151,7 +153,7 @@ class CoreSystem(Node):
                 f"/dispenser_station_{i}/dispense_request",
                 callback_group=station_srv_cli_cbgs[cbg_index]
             )
-            self.get_logger().info(f"Station [{i}] service client is created w/ {station_srv_cli_cbgs[cbg_index]}")
+            self.get_logger().info(f"Station [{i}] service client is created")
         self.get_logger().info("Service Clients are created")
 
         # Timers
@@ -171,7 +173,7 @@ class CoreSystem(Node):
                 lambda station_id=i: self.station_decision_cb(station_id),
                 callback_group=station_timer_cbgs[cbg_index]
             )
-            self.get_logger().info(f"Station [{i}] timer is created w/ {station_timer_cbgs[cbg_index]}")
+            self.get_logger().info(f"Station [{i}] timer is created")
         self.get_logger().info("Timers are created")
 
         # Action clients
@@ -440,7 +442,7 @@ class CoreSystem(Node):
         self.get_logger().debug(f"conveyor_status: {conveyor_status}")
 
         try:
-            acquired = self.occupy_mutex.acquire(timeout=1.0)
+            acquired = self.occupy_mutex.acquire(timeout=self.MUTEX_TIMEOUT)
             if not acquired:
                 self.get_logger().error("Failed to acquire mutex for sensor status update")
                 return
@@ -453,6 +455,8 @@ class CoreSystem(Node):
                 if conveyor := self.conveyor.get_conveyor(conveyor_id):
                     conveyor.is_free = status
 
+        except TimeoutError:
+            self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
         except Exception as e:
             self.get_logger().error(f"Error in loc_sensor_cb: {str(e)}")
         finally:
@@ -501,7 +505,7 @@ class CoreSystem(Node):
         """
         curr_time = self.get_clock().now().to_msg()
         try:
-            acquired = self.mutex.acquire(timeout=1.0)
+            acquired = self.mutex.acquire(timeout=self.MUTEX_TIMEOUT)
             if not acquired:
                 self.get_logger().error("Failed to acquire mutex for status update")
                 return
@@ -510,6 +514,8 @@ class CoreSystem(Node):
                 status.header.stamp = curr_time
                 self.mtrl_box_status_pub.publish(status)
 
+        except TimeoutError:
+            self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
         except Exception as e:
             self.get_logger().error(f"Error in order_status_cb: {str(e)}")
         finally:
@@ -574,10 +580,10 @@ class CoreSystem(Node):
         """
         conveyor_msg: UInt8MultiArray = UInt8MultiArray()
         station_msg: UInt8MultiArray = UInt8MultiArray()
-        curr_conveyor: Optional[ConveyorNode] = self.conveyor.head
 
+        curr_conveyor = self.conveyor.head
         try:
-            acquired = self.occupy_mutex.acquire(timeout=1.0)
+            acquired = self.occupy_mutex.acquire(timeout=self.MUTEX_TIMEOUT)
             if not acquired:
                 self.get_logger().error("Failed to acquire mutex for publishing occupancy status")
                 return
@@ -600,9 +606,8 @@ class CoreSystem(Node):
         
         except TimeoutError:
             self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
-            return
         except Exception as e:
-            self.get_logger().error(f"Error in occupancy_status_cb: {str(e)}")
+            self.get_logger().error(f"Error in occupancy status: {str(e)}")
         finally:
             if self.occupy_mutex.locked():
                 self.occupy_mutex.release()
@@ -617,7 +622,7 @@ class CoreSystem(Node):
         next_conveyor = self.conveyor.get_next_conveyor_by_station(source_station_id)
 
         try:
-            acquired = self.occupy_mutex.acquire(timeout=3.0)
+            acquired = self.occupy_mutex.acquire(timeout=self.MUTEX_TIMEOUT)
             if not acquired:
                 self.get_logger().error("Failed to acquire mutex for status update")
                 return
@@ -633,6 +638,9 @@ class CoreSystem(Node):
                     self.get_logger().error(f"write_registers movement failed")
             else:
                 self.get_logger().error(f"The next conveyor is unavailable")
+        
+        except TimeoutError:
+            self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
         except Exception as e:
             self.get_logger().error(f"Error in _handle_opposite_movement: {str(e)}")
         finally:
@@ -644,7 +652,7 @@ class CoreSystem(Node):
         conveyor = self.conveyor.get_conveyor_by_station(decided_station_id)
 
         try:
-            acquired = self.occupy_mutex.acquire(timeout=1.0)
+            acquired = self.occupy_mutex.acquire(timeout=self.MUTEX_TIMEOUT)
             if not acquired:
                 self.get_logger().error("Failed to acquire mutex for status update")
                 return
@@ -662,6 +670,9 @@ class CoreSystem(Node):
                     self.get_logger().error(f"appeded to to_remove: {(order_id, source_station_id, mtrl_box_id)}")
                 else:
                     self.get_logger().error(f"Failed to write to register {Const.GO_OPPOSITE_ADDR + source_station_id}")
+        
+        except TimeoutError:
+            self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
         except Exception as e:
             self.get_logger().error(f"Error in _handle_opposite_movement: {str(e)}")
         finally:
@@ -885,9 +896,9 @@ class CoreSystem(Node):
                 return Const.GO_STRAIGHT
 
             try:
-                acquired = self.mutex.acquire(timeout=1.0)
+                acquired = self.mutex.acquire(timeout=self.MUTEX_TIMEOUT)
                 if not acquired:
-                    self.get_logger().error(f"Failed to acquire lock to movement_decision_v1 for {material_box_id}")
+                    self.get_logger().error(f"Failed to acquire lock to movement_decision_v1")
                     return Const.GO_STRAIGHT
 
                 for station_id in station_ids:
@@ -896,8 +907,11 @@ class CoreSystem(Node):
                         self.get_logger().info(f"Selected station {station_id} for order {order_id}")
                         return station_id
 
+            except TimeoutError:
+                self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
+                return Const.GO_STRAIGHT
             except Exception as e:
-                self.get_logger().error(f"Error checking binding for {material_box_id}: {str(e)}")
+                self.get_logger().error(f"Error: {str(e)}")
                 return Const.GO_STRAIGHT
             finally:
                 if self.mutex.locked():
@@ -966,7 +980,7 @@ class CoreSystem(Node):
             return False
         
         try:
-            acquired = self.mutex.acquire(timeout=1.0)
+            acquired = self.mutex.acquire(timeout=self.MUTEX_TIMEOUT)
             if not acquired:
                 self.get_logger().error(f"Failed to acquire lock to check binding for {material_box_id}")
                 return False
@@ -977,12 +991,14 @@ class CoreSystem(Node):
                     return True
             return False
         
+        except TimeoutError:
+            self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
         except Exception as e:
             self.get_logger().error(f"Error checking binding for {material_box_id}: {str(e)}")
-            return False
         finally:
             if self.mutex.locked():
                 self.mutex.release()
+            return False
     
     def bind_mtrl_box(self, material_box_id: int) -> Optional[int]:
         """
@@ -1004,7 +1020,7 @@ class CoreSystem(Node):
             raise ValueError(f"Material box ID must be non-negative, got {material_box_id}")
         
         try:
-            acquired = self.mutex.acquire(timeout=1.0)
+            acquired = self.mutex.acquire(timeout=self.MUTEX_TIMEOUT)
             if not acquired:
                 self.get_logger().error("Failed to acquire lock for material box binding")
                 return None
@@ -1020,13 +1036,16 @@ class CoreSystem(Node):
 
             self.get_logger().info("No available material box found for binding")
             return None
+        except TimeoutError:
+            self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
         except Exception as e:
             self.get_logger().error(f"Error in bind_mtrl_box: {str(e)}")
-            return None
         finally:
             if self.mutex.locked():
                 self.mutex.release()
-
+            return None
+        
+    # FIXME: this function is incorrect for drugs contain multi-locations
     def get_curr_gone(self, mtrl_box: MaterialBox) -> set:
         curr_gone = set()
         for cell in mtrl_box.slots:
@@ -1035,6 +1054,7 @@ class CoreSystem(Node):
                 curr_gone.add(station_id)
         return curr_gone
 
+    # FIXME: this function is inaccuracy for validating the requirement
     def get_req_to_go(self, mtrl_box: MaterialBox) -> set:
         req_to_go = set()
         for cell in mtrl_box.slots:
@@ -1046,7 +1066,7 @@ class CoreSystem(Node):
 
     def find_remainder(self, order_id: int) -> Optional[set]:
         try:
-            acquired = self.mutex.acquire(timeout=1.0)
+            acquired = self.mutex.acquire(timeout=self.MUTEX_TIMEOUT)
             if not acquired:
                 self.get_logger().error(f"Failed to acquire lock for finding find_remainder order id: {order_id}")
                 return None
@@ -1068,14 +1088,14 @@ class CoreSystem(Node):
             self.get_logger().warning(f"Order {order_id}: Current stations {sorted(curr_gone)}, Required stations {sorted(req_to_go)}")
 
             return req_to_go - curr_gone 
-        
+        except TimeoutError:
+            self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
         except Exception as e:
             self.get_logger().error(f"Error getting remainder for order_id {order_id}: {str(e)}")
-            return None
-        
         finally:
             if self.mutex.locked():
-                self.mutex.release()
+                self.mutex.release() 
+            return None
 
     def _initialize_conveyor(self) -> None:
         """Initialize Conveyor Structure."""
@@ -1127,7 +1147,7 @@ class CoreSystem(Node):
             raise ValueError(f"Material box ID must be non-negative, got {mtrl_box_id}")
         
         try:
-            acquired = self.mutex.acquire(timeout=1.0)
+            acquired = self.mutex.acquire(timeout=self.MUTEX_TIMEOUT)
             if not acquired:
                 self.get_logger().error(f"Failed to acquire lock for mtrl_box_id {mtrl_box_id}")
                 return None
@@ -1138,13 +1158,15 @@ class CoreSystem(Node):
                     return order_id
 
             self.get_logger().debug(f"No order found for material box {mtrl_box_id}")
-            return None
+
+        except TimeoutError:
+            self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
         except Exception as e:
             self.get_logger().error(f"Error getting order for mtrl_box_id {mtrl_box_id}: {str(e)}")
-            return None
         finally:
             if self.mutex.locked():
                 self.mutex.release()
+            return None
 
     def get_any_pkc_mac_is_idle(self) -> bool:
         """
@@ -1154,7 +1176,7 @@ class CoreSystem(Node):
             bool: True if at least one machine is idle, False otherwise
         """
         try:
-            acquired = self.mutex.acquire(timeout=1.0)
+            acquired = self.mutex.acquire(timeout=self.MUTEX_TIMEOUT)
             if not acquired:
                 self.get_logger().error(f"Failed to acquire lock for packaging machine status")
                 return None
@@ -1169,13 +1191,15 @@ class CoreSystem(Node):
                     return True
                 
             self.get_logger().warning("No idle packaging machines found")
-            return False
+            
+        except TimeoutError:
+            self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
         except Exception as e:
             self.get_logger().error(f"Error getting packaging machine status: {str(e)}")
-            return None
         finally:
             if self.mutex.locked():
                 self.mutex.release()
+            return False
     
     def move_out_station(self, station: DispenserStation, station_id: int, mtrl_box_id: int) -> bool:
         self.get_logger().info(f"Station {station_id} has all cells completed")
@@ -1188,7 +1212,7 @@ class CoreSystem(Node):
         success = self._execute_movement(Const.MOVEMENT_ADDR + station_id, [Const.EXIT_STATION])
         if success:
             try:
-                acquired = self.occupy_mutex.acquire(timeout=3.0)
+                acquired = self.occupy_mutex.acquire(timeout=self.MUTEX_TIMEOUT)
                 self.get_logger().info("locked")
                 if not acquired:
                     self.get_logger().error("Failed to acquire mutex for occupy")
@@ -1197,6 +1221,9 @@ class CoreSystem(Node):
                 conveyor_seg.occupy(mtrl_box_id)
                 station.clear()
                 self.get_logger().info("locked done")
+
+            except TimeoutError:
+                self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
             except Exception as e:
                 self.get_logger().error(f"Error in move_out_station: {str(e)}")
             finally:
@@ -1412,7 +1439,7 @@ class CoreSystem(Node):
             curr_conveyor = self.conveyor.get_conveyor(camera_id)
             if station and curr_conveyor:
                 try:
-                    acquired = self.occupy_mutex.acquire(timeout=1.0)
+                    acquired = self.occupy_mutex.acquire(timeout=self.MUTEX_TIMEOUT)
                     if not acquired:
                         self.get_logger().error("Failed to acquire mutex for occupy")
                         return False
@@ -1420,6 +1447,8 @@ class CoreSystem(Node):
                     station.occupy(material_box_id)
                     curr_conveyor.clear()
 
+                except TimeoutError:
+                    self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
                 except Exception as e:
                     self.get_logger().error(f"Error in camera_1_to_8_action 1: {str(e)}")
                 finally:
@@ -1443,7 +1472,7 @@ class CoreSystem(Node):
                 curr_conveyor = self.conveyor.get_conveyor(camera_id)
                 if curr_conveyor:
                     try:
-                        acquired = self.occupy_mutex.acquire(timeout=1.0)
+                        acquired = self.occupy_mutex.acquire(timeout=self.MUTEX_TIMEOUT)
                         if not acquired:
                             self.get_logger().error("Failed to acquire mutex for occupy")
                             return False
@@ -1451,6 +1480,8 @@ class CoreSystem(Node):
                         next_conveyor.occupy(material_box_id)
                         curr_conveyor.clear()
 
+                    except TimeoutError:
+                        self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
                     except Exception as e:
                         self.get_logger().error(f"Error in camera_1_to_8_action 2: {str(e)}")
                     finally:
@@ -1478,13 +1509,15 @@ class CoreSystem(Node):
 
         if curr_conveyor := self.conveyor.get_conveyor(camera_id):
             try:
-                acquired = self.occupy_mutex.acquire(timeout=1.0)
+                acquired = self.occupy_mutex.acquire(timeout=self.MUTEX_TIMEOUT)
                 if not acquired:
                     self.get_logger().error("Failed to acquire mutex for occupy")
                     return
 
                 curr_conveyor.clear()
 
+            except TimeoutError:
+                self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
             except Exception as e:
                 self.get_logger().error(f"Error in camera_9_action: {str(e)}")
             finally:
