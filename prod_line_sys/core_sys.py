@@ -998,7 +998,6 @@ class CoreSystem(Node):
         finally:
             if self.mutex.locked():
                 self.mutex.release()
-            return False
     
     def bind_mtrl_box(self, material_box_id: int) -> Optional[int]:
         """
@@ -1036,14 +1035,13 @@ class CoreSystem(Node):
 
             self.get_logger().info("No available material box found for binding")
             return None
-        except TimeoutError:
-            self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
         except Exception as e:
             self.get_logger().error(f"Error in bind_mtrl_box: {str(e)}")
+            return None
         finally:
             if self.mutex.locked():
                 self.mutex.release()
-            return None
+            
         
     # FIXME: this function is incorrect for drugs contain multi-locations
     def get_curr_gone(self, mtrl_box: MaterialBox) -> set:
@@ -1095,7 +1093,6 @@ class CoreSystem(Node):
         finally:
             if self.mutex.locked():
                 self.mutex.release() 
-            return None
 
     def _initialize_conveyor(self) -> None:
         """Initialize Conveyor Structure."""
@@ -1166,7 +1163,7 @@ class CoreSystem(Node):
         finally:
             if self.mutex.locked():
                 self.mutex.release()
-            return None
+            
 
     def get_any_pkc_mac_is_idle(self) -> bool:
         """
@@ -1191,7 +1188,7 @@ class CoreSystem(Node):
                     return True
                 
             self.get_logger().warning("No idle packaging machines found")
-            
+            return False
         except TimeoutError:
             self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
         except Exception as e:
@@ -1199,7 +1196,7 @@ class CoreSystem(Node):
         finally:
             if self.mutex.locked():
                 self.mutex.release()
-            return False
+
     
     def move_out_station(self, station: DispenserStation, station_id: int, mtrl_box_id: int) -> bool:
         self.get_logger().info(f"Station {station_id} has all cells completed")
@@ -1551,7 +1548,7 @@ class CoreSystem(Node):
         if len(remainder) == 0 and self.get_any_pkc_mac_is_idle():
             if status := self.mtrl_box_status.get(order_id):
                 with self.mutex:
-                    status.status = PackagingMachineStatus.STATUS_AWAITING_PACKAGING
+                    status.status = MaterialBoxStatus.STATUS_AWAITING_PACKAGING
             pkg_req_success = self.send_pkg_req(order_id)
             if pkg_req_success:
                 self.get_logger().warning(f"Sent a packaging request to packaging machine manager successfully")
@@ -1592,7 +1589,7 @@ class CoreSystem(Node):
 
         elif not self.is_elevator_ready:
             if status := self.mtrl_box_status.get(order_id):
-                if status.status == PackagingMachineStatus.STATUS_PASS_TO_PACKAGING:
+                if status.status == MaterialBoxStatus.STATUS_PASS_TO_PACKAGING:
                     elevator_success = self._execute_movement(Const.TRANSFER_MTRL_BOX_ADDR, Const.MTRL_BOX_RETRIEVAL_PLC_VALUES)
                     if elevator_success:
                         is_completed = True
@@ -2028,7 +2025,7 @@ class CoreSystem(Node):
 
             if status := self.mtrl_box_status.get(order_id):
                 with self.mutex:
-                    status.status = PackagingMachineStatus.STATUS_PASS_TO_PACKAGING
+                    status.status = MaterialBoxStatus.STATUS_PASS_TO_PACKAGING
 
             order = self.proc_order.pop(order_id)
             if order:
