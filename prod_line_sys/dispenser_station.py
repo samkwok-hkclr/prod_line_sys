@@ -8,6 +8,7 @@ class DispenserStation:
         self.id = station_id
         self._curr_mtrl_box: int = 0
         self._is_occupied: bool = False
+        self._is_cleared_up_conveyor: bool = False
         self._is_free: bool = True
         self._curr_sliding_platform: int = 0
         self._cmd_sliding_platform: int = 0
@@ -23,7 +24,7 @@ class DispenserStation:
         with self.mutex:
             self._curr_mtrl_box = 0
             self._is_occupied = False
-
+            self._is_cleared_up_conveyor = False
             self._is_completed = [False] * Const.CELLS
             self._is_dispense_req_sent = [False] * Const.CELLS
             self._is_dispense_req_done = [False] * Const.CELLS
@@ -77,6 +78,18 @@ class DispenserStation:
             raise TypeError(f"Expected boolean for is_free, got {type(value).__name__}")
         with self.mutex:
             self._is_free = value 
+
+    @property
+    def is_cleared_up_conveyor(self):
+        with self.mutex:
+            return self._is_cleared_up_conveyor
+    
+    @is_cleared_up_conveyor.setter
+    def is_cleared_up_conveyor(self, value):
+        if not isinstance(value, bool):
+            raise TypeError(f"Expected boolean for is_cleared_up_conveyor, got {type(value).__name__}")
+        with self.mutex:
+            self._is_cleared_up_conveyor = value 
 
     @property
     def curr_sliding_platform(self):

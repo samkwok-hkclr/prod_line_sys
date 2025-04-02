@@ -14,7 +14,7 @@ class Const:
     PKG_MAC_ID_START: Final[int] = 1
     PKG_MAC_ID_END: Final[int] = 2
 
-    MAX_MTRL_BOX_IN_CON: Final[int] = 20
+    MAX_MTRL_BOX_IN_CON: Final[int] = 30
 
     GO_STRAIGHT: Final[int] = 0
     
@@ -110,4 +110,29 @@ class Const:
         9: range(74, 77)
     }
     
-
+    JACK_UP_POINT: Final[Dict] = {
+        1: 1,
+        2: 1,
+        3: 2,
+        4: 2,
+        5: 3,
+        6: 3,
+        7: 4,
+        8: 5,
+        9: 6,
+        10: 6,
+        11: 7,
+        12: 7,
+        13: 8,
+        14: 8,
+    }
+    JACK_UP_POINT_INDEX: Final[Dict] = {
+        1: 3,
+        2: 12,
+        3: 21,
+        4: 30,
+        5: 43,
+        6: 49,
+        7: 58,
+        8: 67,
+    }

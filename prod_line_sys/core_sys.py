@@ -72,6 +72,7 @@ class CoreSystem(Node):
         # ROS2 client node, maybe unused
         self.test_cli_node = rclpy.create_node("test_cli_node")
         self.exec.add_node(self.test_cli_node)
+        self.jack_up_status: [int, bool] = dict()
 
         # mutex
         self.mutex = Lock()
@@ -116,6 +117,7 @@ class CoreSystem(Node):
         self.mtrl_box_status_pub = self.create_publisher(MaterialBoxStatus, "material_box_status", 10)
         self.station_occupancy_pub = self.create_publisher(UInt8MultiArray, "station_occupancy", 10)
         self.conveyor_occupancy_pub = self.create_publisher(UInt8MultiArray, "conveyor_occupancy", 10)
+        self.jack_up_pub = self.create_publisher(UInt8MultiArray, "jack_up_status", 10)
         self.get_logger().info("Publishers are created")
 
         # Subscriptions
@@ -161,7 +163,7 @@ class CoreSystem(Node):
         self.start_order_timer = self.create_timer(1.0, self.start_order_cb, callback_group=normal_timer_cbg)
         self.order_status_timer = self.create_timer(1.0, self.order_status_cb, callback_group=normal_timer_cbg)
         self.elevator_timer = self.create_timer(1.0, self.elevator_dequeue_cb, callback_group=normal_timer_cbg)
-        # self.init_vision_timer = self.create_timer(30.0, self.init_vision_cb, callback_group=normal_timer_cbg)
+        self.init_vision_timer = self.create_timer(30.0, self.init_vision_cb, callback_group=normal_timer_cbg)
         self.jack_up_timer = self.create_timer(1.0, self.jack_up_cb, callback_group=jack_up_timer_cbg)
         self.occupancy_status_timer = self.create_timer(1.0, self.occupancy_status_cb, callback_group=normal_timer_cbg)
         self.dis_station_timers: Dict[int, rclpy.Timer.Timer] = dict()
@@ -408,8 +410,9 @@ class CoreSystem(Node):
                 state_changed = True
 
         if state_changed:
-            # if self.vision_request:
-            #     self.send_vision_req(self.vision_request.popleft())
+            if len(self.vision_request) > 0:
+                self.send_vision_req(self.vision_request.popleft())
+                self.get_logger().info(f"Added to vision request")
             self.get_logger().info(f"Vision block state changed 0 -> 1 at {timestamp}. Queue size: {len(self.vision_request)}")
         elif msg.data != prev_vision_block_state:
             self.get_logger().debug(f"EleVision blockvator state changed 1 -> 0. Queue size: {len(self.vision_request)}")
@@ -440,6 +443,10 @@ class CoreSystem(Node):
         }
         self.get_logger().debug(f"station_status: {station_status}")
         self.get_logger().debug(f"conveyor_status: {conveyor_status}")
+        
+        for pt, idx in Const.JACK_UP_POINT_INDEX.items():
+            self.jack_up_status[pt] = bool(sensor_data[idx])
+        self.get_logger().debug(f"self.jack_up_status: {self.jack_up_status}")
 
         try:
             acquired = self.occupy_mutex.acquire(timeout=self.MUTEX_TIMEOUT)
@@ -466,7 +473,7 @@ class CoreSystem(Node):
         self.get_logger().debug(f"Sensor data matached")
 
     # Timers callback
-    async def start_order_cb(self) -> None:
+    def start_order_cb(self) -> None:
         with self.mutex:
             if self.elevator_request:
                 self.get_logger().debug("The material box retrieval have higher priority")
@@ -485,8 +492,8 @@ class CoreSystem(Node):
 
         success = self._execute_movement(Const.TRANSFER_MTRL_BOX_ADDR, Const.MTRL_BOX_RELEASE_PLC_VALUES)
         if success:
-            with self.occupy_mutex:
-                conveyor_seg.occupy(-1) # FIXME: do not know the material box id
+            # with self.occupy_mutex:
+            #     conveyor_seg.occupy(-1) # FIXME: do not know the material box id
             with self.mutex:
                 highest_priority_order = max(self.recv_order, key=lambda _order: _order.priority)
                 self.proc_order[highest_priority_order.order_id] = deepcopy(highest_priority_order)
@@ -499,7 +506,7 @@ class CoreSystem(Node):
         else:
             self.get_logger().error("Failed to call the PLC to release a material box")
     
-    async def order_status_cb(self) -> None:
+    def order_status_cb(self) -> None:
         """
         update and publish material box status messages.
         """
@@ -529,7 +536,7 @@ class CoreSystem(Node):
         # success = await self.write_registers(5014, [2])
         # self.get_logger().error(f"success: {self.get_clock().now()}")
 
-    async def elevator_dequeue_cb(self) -> None:
+    def elevator_dequeue_cb(self) -> None:
         if self.is_releasing_mtrl_box or len(self.elevator_queue) == 0:
             return
 
@@ -549,20 +556,24 @@ class CoreSystem(Node):
         self.get_logger().warning(f"Started decision-making at jack-up point: {len(self.jack_up_queue)}")
         to_remove = []
 
-        for order_id, source_station_id, mtrl_box_id in list(self.jack_up_queue):
+        for jack_up_pt, order_id, source_station_id, mtrl_box_id in list(self.jack_up_queue):
+            if not self.jack_up_status.get(jack_up_pt):
+                self.get_logger().warning(f"jack_up_pt: {jack_up_pt} does not ready")
+                continue
+
             opposite = Const.STATION_OPPOSITE.get(source_station_id, [])
             if not opposite:
                 self.get_logger().warning(f"order_id: {order_id} should be leave")
-                self._handle_exit_movement(order_id, source_station_id, mtrl_box_id, to_remove)
+                self._handle_exit_movement(order_id, source_station_id, mtrl_box_id, to_remove, jack_up_pt)
                 continue
             
             decided_station_id = self.movement_decision_v1(order_id, opposite)
             if decided_station_id in opposite:
                 self.get_logger().warning(f"order_id: {order_id} should be move to opposite station")
-                self._handle_opposite_movement(order_id, source_station_id, mtrl_box_id, decided_station_id, to_remove)
+                self._handle_opposite_movement(order_id, source_station_id, mtrl_box_id, decided_station_id, to_remove, jack_up_pt)
             else:
-                self.get_logger().warning(f"order_id: {order_id} should be leave because opposite station is unavailable")
-                self._handle_exit_movement(order_id, source_station_id, mtrl_box_id, to_remove)
+                self.get_logger().warning(f"order_id: {order_id} should be leave because opposite station is unavailable or does not required")
+                self._handle_exit_movement(order_id, source_station_id, mtrl_box_id, to_remove, jack_up_pt)
 
         for item in to_remove:
             self.jack_up_queue.remove(item)
@@ -580,6 +591,7 @@ class CoreSystem(Node):
         """
         conveyor_msg: UInt8MultiArray = UInt8MultiArray()
         station_msg: UInt8MultiArray = UInt8MultiArray()
+        jack_up_status_msg: UInt8MultiArray = UInt8MultiArray()
 
         curr_conveyor = self.conveyor.head
         try:
@@ -587,6 +599,9 @@ class CoreSystem(Node):
             if not acquired:
                 self.get_logger().error("Failed to acquire mutex for publishing occupancy status")
                 return
+
+            for state in self.jack_up_status.values():
+                jack_up_status_msg.data.append(state)
             
             while curr_conveyor:
                 conveyor_msg.data.append(curr_conveyor.is_occupied)
@@ -616,8 +631,9 @@ class CoreSystem(Node):
         self.get_logger().debug(f"Station occupancy data: {station_msg.data}")
         self.conveyor_occupancy_pub.publish(conveyor_msg)
         self.station_occupancy_pub.publish(station_msg)
+        self.jack_up_pub.publish(jack_up_status_msg)
                 
-    def _handle_exit_movement(self, order_id: int, source_station_id: int, mtrl_box_id: int, to_remove: list) -> None:
+    def _handle_exit_movement(self, order_id: int, source_station_id: int, mtrl_box_id: int, to_remove: list, jack_up_pt: int) -> None:
         self.get_logger().info(f"_handle_exit_movement!!!!!!!!!!!!!")
         next_conveyor = self.conveyor.get_next_conveyor_by_station(source_station_id)
 
@@ -632,8 +648,9 @@ class CoreSystem(Node):
 
                 success = self._execute_movement(Const.GO_OPPOSITE_ADDR + source_station_id, Const.EXIT_JACK_UP_VALUE)
                 if success:
-                    to_remove.append((order_id, source_station_id, mtrl_box_id))
-                    self.get_logger().error(f"appeded to to_remove: {(order_id, source_station_id, mtrl_box_id)}")
+                    tmp = (jack_up_pt, order_id, source_station_id, mtrl_box_id)
+                    to_remove.append(tmp)
+                    self.get_logger().error(f"appeded to to_remove: {tmp}")
                 else:
                     self.get_logger().error(f"write_registers movement failed")
             else:
@@ -647,7 +664,7 @@ class CoreSystem(Node):
             if self.occupy_mutex.locked():
                 self.occupy_mutex.release()
 
-    def _handle_opposite_movement(self, order_id: int, source_station_id: int, mtrl_box_id: int, decided_station_id: int, to_remove: list) -> None:
+    def _handle_opposite_movement(self, order_id: int, source_station_id: int, mtrl_box_id: int, decided_station_id: int, to_remove: list, jack_up_pt: int) -> None:
         target_station = self.conveyor.get_station(decided_station_id)
         conveyor = self.conveyor.get_conveyor_by_station(decided_station_id)
 
@@ -661,13 +678,14 @@ class CoreSystem(Node):
                 success = self._execute_movement(Const.GO_OPPOSITE_ADDR + source_station_id, Const.MOVE_OPPOSITE_VALUE)
                 if success:
                     target_station.occupy(mtrl_box_id)
-                    conveyor.clear()
+                    # conveyor.clear()
 
                     self.get_logger().error(f">>>>> Station Occupied: {target_station.id} by material box: {mtrl_box_id}")
-                    self.get_logger().error(f">>>>> Conveyor Clear: {conveyor.id}")
-
-                    to_remove.append((order_id, source_station_id, mtrl_box_id))
-                    self.get_logger().error(f"appeded to to_remove: {(order_id, source_station_id, mtrl_box_id)}")
+                    # self.get_logger().error(f">>>>> Conveyor Clear: {conveyor.id}")
+                    
+                    tmp = (jack_up_pt, order_id, source_station_id, mtrl_box_id)
+                    to_remove.append(tmp)
+                    self.get_logger().error(f"appeded to to_remove: {tmp}")
                 else:
                     self.get_logger().error(f"Failed to write to register {Const.GO_OPPOSITE_ADDR + source_station_id}")
         
@@ -679,7 +697,7 @@ class CoreSystem(Node):
             if self.occupy_mutex.locked():
                 self.occupy_mutex.release()
     
-    async def qr_handle_cb(self) -> None:
+    def qr_handle_cb(self) -> None:
         with self.qr_scan_mutex:
             self.get_logger().debug(f"len(self.qr_scan): {len(self.qr_scan)}")
             if not self.qr_scan:
@@ -705,19 +723,19 @@ class CoreSystem(Node):
                     order_id = self.get_order_id_by_mtrl_box(material_box_id)
                     if camera_1_result:
                         continue
-                    is_completed = await self.camera_1_to_8_action(order_id, material_box_id, camera_id) 
+                    is_completed = self.camera_1_to_8_action(order_id, material_box_id, camera_id) 
                 case 2 | 3 | 4 | 5 | 6 | 7 | 8: # QR camera
                     if order_id is None:
                         self.get_logger().info(f"The scan maybe incorrect cameras: {msg.camera_id}, box: {msg.material_box_id} ")
                         is_completed = True
                     else:
-                        is_completed = await self.camera_1_to_8_action(order_id, material_box_id, camera_id) 
+                        is_completed = self.camera_1_to_8_action(order_id, material_box_id, camera_id) 
                 case 9: # vision inspection
-                    is_completed = await self.camera_9_action(order_id, material_box_id, camera_id)  
+                    is_completed = self.camera_9_action(order_id, material_box_id, camera_id)  
                 case 10: # packaging machine 1
-                    is_completed = await self.camera_10_action(order_id, material_box_id, camera_id)      
+                    is_completed = self.camera_10_action(order_id, material_box_id, camera_id)      
                 case 11: # packaging machine 2
-                    is_completed = await self.camera_11_action(order_id, material_box_id, camera_id)      
+                    is_completed = self.camera_11_action(order_id, material_box_id, camera_id)      
                 case _:
                     self.get_logger().info(f"Received unknown camera ID: {camera_id}")
                 
@@ -761,22 +779,31 @@ class CoreSystem(Node):
         filtered_missing, target_cell = self.find_target_cell(station, station_id, status, order)
         self.get_logger().warning(f"target_cell: {target_cell}")
 
+        if not station.is_cleared_up_conveyor:
+            curr_conveyor = self.conveyor.get_conveyor_by_station(station_id)
+            curr_conveyor.clear()
+            station.is_cleared_up_conveyor = True
+            self.get_logger().error(f"The conveyor [{curr_conveyor.id}] of station {station_id} is cleared up")
+
         if target_cell >= Const.EXIT_STATION:
             self.get_logger().error(f"The station {station_id} is completed dispense for the material box {mtrl_box_id}")
             success = self.move_out_station(station, station_id, mtrl_box_id)
             if success:
-                self.jack_up_queue.append((order_id, station_id, mtrl_box_id))
+                self.jack_up_queue.append((Const.JACK_UP_POINT[station_id], order_id, station_id, mtrl_box_id))
                 self.get_logger().warning(f"Appended {(order_id, station_id, mtrl_box_id)} to jack-up queue")
+
         elif cmd_sliding_platform == 0 or \
              cmd_sliding_platform != curr_sliding_platform or \
              cmd_sliding_platform != target_cell + 1:
             self.get_logger().info(f"station: {station_id} is sending the movement command")
-            success = self._execute_movement(Const.MOVEMENT_ADDR + station_id, [self.map_index(target_cell + 1)])
-            if success:
-                self.get_logger().warning(f"station: {station_id} is moving to {target_cell + 1} cell")
+            if target_cell + 1 != Const.EXIT_STATION:
+                success = self._execute_movement(Const.MOVEMENT_ADDR + station_id, [self.map_index(target_cell + 1)])
+                if success:
+                    self.get_logger().warning(f"station: {station_id} is moving to {target_cell + 1} cell")
+                else:
+                    self.get_logger().error(f"write_registers movement failed")
             else:
-                self.get_logger().error(f"write_registers movement failed")
-        
+                self.get_logger().error(f"target_cell + 1 == Const.EXIT_STATION")
         elif station.get_dispense_req_sent(target_cell):
             self.get_logger().debug(f"The station {[station_id]} dispense request are already sent! skip!")
             
@@ -822,7 +849,7 @@ class CoreSystem(Node):
         self.get_logger().debug(f"Successfully processed order {order_id}")
         return res
     
-    async def move_sliding_platform_cb(self, req, res):
+    def move_sliding_platform_cb(self, req, res):
         """
         Move the sliding platform to a specified cell for a dispense station.
         
@@ -1200,6 +1227,14 @@ class CoreSystem(Node):
     
     def move_out_station(self, station: DispenserStation, station_id: int, mtrl_box_id: int) -> bool:
         self.get_logger().info(f"Station {station_id} has all cells completed")
+
+        if station_id in (1, 2) and self.is_releasing_mtrl_box:
+            self.get_logger().info("The material box is releasing. Try to move out in the next callback")
+            return False
+
+        if self.jack_up_status.get(station_id):
+            self.get_logger().error(f"Jack-up point is busy, wait for next callback")
+            return False
             
         conveyor_seg = self.conveyor.get_conveyor_by_station(station_id)
         if conveyor_seg and not conveyor_seg.available():
@@ -1388,7 +1423,7 @@ class CoreSystem(Node):
 
         return is_continue
     
-    async def camera_1_to_8_action(self, order_id: int, material_box_id: int, camera_id: int) -> Optional[bool]:
+    def camera_1_to_8_action(self, order_id: int, material_box_id: int, camera_id: int) -> Optional[bool]:
         """
         Process operations for camera 1 to 8 for a given order and material box.
         
@@ -1442,7 +1477,7 @@ class CoreSystem(Node):
                         return False
 
                     station.occupy(material_box_id)
-                    curr_conveyor.clear()
+                    # curr_conveyor.clear() 
 
                 except TimeoutError:
                     self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
@@ -1453,7 +1488,7 @@ class CoreSystem(Node):
                         self.occupy_mutex.release()
 
                 self.get_logger().error(f">>>>> Station Occupied: {station.id} by material box: {material_box_id}")
-                self.get_logger().error(f">>>>> Conveyor Released: {curr_conveyor.id}")
+                # self.get_logger().error(f">>>>> Conveyor Released: {curr_conveyor.id}")
                 is_completed = True
         else: 
             # try to go straight
@@ -1494,13 +1529,13 @@ class CoreSystem(Node):
         self.get_logger().warning(f"decision [{decision}] / {station_ids} is made for material box [{material_box_id}] in camera [{camera_id}]")
         return is_completed
     
-    async def camera_9_action(self, order_id: int, material_box_id: int, camera_id: int) -> Optional[bool]:
+    def camera_9_action(self, order_id: int, material_box_id: int, camera_id: int) -> Optional[bool]:
         is_completed = True
         
         # FIXME: Wait the vision system complete
         # remainder = self.find_remainder(order_id)
         # if len(remainder) == 0:
-        #     self.vision_request.append(order_id)
+        self.vision_request.append(order_id)
 
         self.get_logger().warning(f"Go straight for camera {camera_id}")
 
@@ -1528,7 +1563,7 @@ class CoreSystem(Node):
         self.get_logger().info(f"Vision inspection triggered for material box [{material_box_id}]")
         return is_completed
         
-    async def camera_10_action(self, order_id: int, material_box_id: int, camera_id: int) -> Optional[bool]:
+    def camera_10_action(self, order_id: int, material_box_id: int, camera_id: int) -> Optional[bool]:
         """
         Process operations for camera 10 for a given order and material box.
         
@@ -1568,7 +1603,7 @@ class CoreSystem(Node):
         self.get_logger().info(f"Packaging machine 1 triggered for material box [{material_box_id}]")    
         return is_completed
     
-    async def camera_11_action(self, order_id: int, material_box_id: int, camera_id: int) -> Optional[bool]:
+    def camera_11_action(self, order_id: int, material_box_id: int, camera_id: int) -> Optional[bool]:
         """
         Process operations for camera 11 for a given order and material box.
         
@@ -1959,7 +1994,7 @@ class CoreSystem(Node):
         if not isinstance(order_id, int):
             raise TypeError(f"Expected integer order_id, got {type(address).__name__}")
 
-        while not self.visual_action_cli.wait_for_service(timeout_sec=1.0):
+        while not self.visual_action_cli.wait_for_server(timeout_sec=1.0):
             if not rclpy.ok():
                 return None
             self.get_logger().info("Waiting for vision action server not available, waiting again...")
