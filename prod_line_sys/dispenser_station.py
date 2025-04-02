@@ -8,10 +8,12 @@ class DispenserStation:
         self.id = station_id
         self._curr_mtrl_box: int = 0
         self._is_occupied: bool = False
-        self._is_cleared_up_conveyor: bool = False
         self._is_free: bool = True
         self._curr_sliding_platform: int = 0
         self._cmd_sliding_platform: int = 0
+        
+        self._is_cleared_up_conveyor: bool = False
+
         self._is_completed: List[bool] = [False] * Const().CELLS
         self._is_dispense_req_sent: List[bool] = [False] * Const.CELLS
         self._is_dispense_req_done: List[bool] = [False] * Const.CELLS
