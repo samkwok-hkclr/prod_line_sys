@@ -111,6 +111,8 @@ class CoreSystem(Node):
         normal_timer_cbg = MutuallyExclusiveCallbackGroup()
         qr_handle_timer_cbg = MutuallyExclusiveCallbackGroup()
         jack_up_timer_cbg = MutuallyExclusiveCallbackGroup()
+        clear_timer_cbg = MutuallyExclusiveCallbackGroup()
+        init_vision_timer_cbg = MutuallyExclusiveCallbackGroup()
         station_timer_cbgs = [MutuallyExclusiveCallbackGroup() for _ in range(Const.NUM_DISPENSER_STATIONS)]
         self.get_logger().info("Callback groups are created")
 
@@ -165,10 +167,10 @@ class CoreSystem(Node):
         self.start_order_timer = self.create_timer(1.0, self.start_order_cb, callback_group=normal_timer_cbg)
         self.order_status_timer = self.create_timer(1.0, self.order_status_cb, callback_group=normal_timer_cbg)
         self.elevator_timer = self.create_timer(1.0, self.elevator_dequeue_cb, callback_group=normal_timer_cbg)
-        self.init_vision_timer = self.create_timer(30.0, self.init_vision_cb, callback_group=normal_timer_cbg)
+        # self.init_vision_timer = self.create_timer(30.0, self.init_vision_cb, callback_group=init_vision_timer_cbg)
         self.jack_up_timer = self.create_timer(1.0, self.jack_up_cb, callback_group=jack_up_timer_cbg)
         self.occupancy_status_timer = self.create_timer(1.0, self.occupancy_status_cb, callback_group=normal_timer_cbg)
-        self.clear_conveyor_occupancy_timer = self.create_timer(0.2, self.clear_conveyor_occupancy_cb, callback_group=normal_timer_cbg)
+        self.clear_conveyor_occupancy_timer = self.create_timer(0.2, self.clear_conveyor_occupancy_cb, callback_group=clear_timer_cbg)
         self.dis_station_timers: Dict[int, rclpy.Timer.Timer] = dict()
         for i in range(1, Const.NUM_DISPENSER_STATIONS + 1):
             cbg_index = int(i - 1)
@@ -235,10 +237,10 @@ class CoreSystem(Node):
                 if station is None:
                     self.get_logger().warning(f"No station found for ID {station_id} <<<< 1")
                     continue
-                platform_location_mapped = self.inverse_map_index(platform_location)
+                # platform_location_mapped = self.inverse_map_index(platform_location)
                 with self.mutex:
-                    station.curr_sliding_platform = platform_location_mapped
-                updated_stations.append((station_id, platform_location_mapped))
+                    station.curr_sliding_platform = platform_location
+                updated_stations.append((station_id, platform_location))
 
             if updated_stations:
                 self.get_logger().debug(f"Updated {len(updated_stations)} sliding platforms location: {dict(updated_stations)}")
@@ -268,10 +270,10 @@ class CoreSystem(Node):
                 if station is None:
                     self.get_logger().warning(f"No station found for ID {station_id} <<<< 2")
                     continue
-                state_mapped = self.inverse_map_index(state)
+                # state_mapped = self.inverse_map_index(state)
                 with self.mutex:
-                    station.cmd_sliding_platform = state_mapped
-                updated_stations.append((station_id, state_mapped))
+                    station.cmd_sliding_platform = state
+                updated_stations.append((station_id, state))
 
             if updated_stations:
                 self.get_logger().debug(f"Updated {len(updated_stations)} sliding platforms command: {dict(updated_stations)}")
@@ -414,7 +416,7 @@ class CoreSystem(Node):
 
         if state_changed:
             if len(self.vision_request) > 0:
-                self.send_vision_req(self.vision_request.popleft())
+                # self.send_vision_req(self.vision_request.popleft())
                 self.get_logger().info(f"Added to vision request")
             self.get_logger().info(f"Vision block state changed 0 -> 1 at {timestamp}. Queue size: {len(self.vision_request)}")
         elif msg.data != prev_vision_block_state:
@@ -536,13 +538,6 @@ class CoreSystem(Node):
         finally:
             if self.mutex.locked():
                 self.mutex.release()
-        
-        # future = run_coroutine_threadsafe(self.read_registers(5030, 1), self.loop)
-        # values = future.result()
-        # self.get_logger().error(f"values: {values[0]}  {self.get_clock().now()}")
-
-        # success = await self.write_registers(5014, [2])
-        # self.get_logger().error(f"success: {self.get_clock().now()}")
 
     def elevator_dequeue_cb(self) -> None:
         if self.is_releasing_mtrl_box or len(self.elevator_queue) == 0:
@@ -715,7 +710,7 @@ class CoreSystem(Node):
                 self.get_logger().error("Failed to acquire mutex for status update")
                 return
             
-            if conveyor and target_station and conveyor.available() and target_station.available():
+            if conveyor and target_station and target_station.available():
                 success = self._execute_movement(Const.GO_OPPOSITE_ADDR + source_station_id, Const.MOVE_OPPOSITE_VALUE)
                 if success:
                     target_station.occupy(mtrl_box_id)
@@ -728,7 +723,7 @@ class CoreSystem(Node):
                 else:
                     self.get_logger().error(f"Failed to write to register {Const.GO_OPPOSITE_ADDR + source_station_id}")
             else:
-                self.get_logger().error(f"Station [{target_station.id}] or Conveyor [{conveyor.id}] is unavailable")
+                self.get_logger().error(f"Station [{target_station.id}] is unavailable")
         except TimeoutError:
             self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
         except Exception as e:
@@ -837,7 +832,8 @@ class CoreSystem(Node):
              cmd_sliding_platform != target_cell + 1:
             self.get_logger().info(f"station: {station_id} is sending the movement command")
             if target_cell + 1 != Const.EXIT_STATION:
-                success = self._execute_movement(Const.MOVEMENT_ADDR + station_id, [self.map_index(target_cell + 1)])
+                # success = self._execute_movement(Const.MOVEMENT_ADDR + station_id, [self.map_index(target_cell + 1)])
+                success = self._execute_movement(Const.MOVEMENT_ADDR + station_id, [target_cell + 1])
                 if success:
                     self.get_logger().warning(f"station: {station_id} is moving to {target_cell + 1} cell")
                 else:
@@ -919,14 +915,16 @@ class CoreSystem(Node):
             res.message = f"Station ID {station_id} must be non-negative"
             return res
     
-        success = self._execute_movement(Const.MOVEMENT_ADDR + station_id, [self.map_index(cell_no)])
+        # success = self._execute_movement(Const.MOVEMENT_ADDR + station_id, [self.map_index(cell_no)])
+        success = self._execute_movement(Const.MOVEMENT_ADDR + station_id, [cell_no])
         res.success = success
 
         if success:
             self.get_logger().info(f"Successfully moved sliding platform to cell {cell_no} at station {station_id}")
             res.message = "Platform movement successful"
         else:
-            error_msg = f"Failed to write to register {Const.MOVEMENT_ADDR + station_id} with cell_no {self.map_index(cell_no)}"
+            # error_msg = f"Failed to write to register {Const.MOVEMENT_ADDR + station_id} with cell_no {self.map_index(cell_no)}"
+            error_msg = f"Failed to write to register {Const.MOVEMENT_ADDR + station_id} with cell_no {cell_no}"
             self.get_logger().error(error_msg)
             res.message = error_msg
 
@@ -1392,7 +1390,7 @@ class CoreSystem(Node):
             target_cell = Const.EXIT_STATION
             
         filtered_missing = None
-        DEBUG_FLAG = True
+        DEBUG_FLAG = False
         try:
             while target_cell < Const.CELLS:
                 self.get_logger().error(f"Checking target_cell: {target_cell}")
@@ -1409,17 +1407,17 @@ class CoreSystem(Node):
                 curr: Set[Tuple[int, int, int], ...] = set()
                 for drug in cell_curr_mtrl_box.dispensing_detail:
                     curr.add((drug.location.dispenser_station, drug.location.dispenser_unit, drug.amount))
-                if DEBUG_FLAG or bool(required):
+                if DEBUG_FLAG and bool(required):
                     self.get_logger().warning(f"required: {required}")
-                if DEBUG_FLAG or bool(curr):
+                if DEBUG_FLAG and bool(curr):
                     self.get_logger().warning(f"curr: {curr}")
 
                 missing_sets = [req_set for req_set in required if req_set not in curr]
                 missing_lists = [list(req_set) for req_set in missing_sets]
 
-                if DEBUG_FLAG or missing_sets:
+                if DEBUG_FLAG and missing_sets:
                     self.get_logger().warning(f"missing_sets: {missing_sets}")
-                if DEBUG_FLAG or missing_lists:
+                if DEBUG_FLAG and missing_lists:
                     self.get_logger().warning(f"missing_lists: {missing_lists}")
 
                 # Find missing drugs for this station

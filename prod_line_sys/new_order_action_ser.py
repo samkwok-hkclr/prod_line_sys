@@ -3,6 +3,7 @@ from typing import Dict, Optional
 from collections import deque
 from threading import Lock
 from functools import partial
+from copy import deepcopy
 
 import rclpy
 
@@ -14,7 +15,7 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallb
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 
 from smdps_msgs.msg import OrderRequest, OrderResponse, MaterialBoxStatus
-from smdps_msgs.srv import NewOrder
+from smdps_msgs.srv import NewOrder, PackagingOrder, SimplifiedPackagingOrder
 from smdps_msgs.action import NewOrder as NewOrderAction
 
 
@@ -25,7 +26,7 @@ class NewOrderActionServer(Node):
         self._status_lock = Lock()
         self.mtrl_box_status: Dict[int, (MaterialBoxStatus, rclpy.time.Time)] = {} # order_id, MaterialBoxStatus
         self.order_sent: Dict[int, (bool, rclpy.time.Time)] = {}
-
+        self.pkg_order: Dict[int, OrderRequest] = {} # order_id, OrderRequest
         self.waiting_result = self.create_rate(1.0, self.get_clock())
 
          # Action server goal
@@ -36,7 +37,7 @@ class NewOrderActionServer(Node):
         # Callback groups
         sub_cbg = MutuallyExclusiveCallbackGroup()
         srv_cli_cbg = MutuallyExclusiveCallbackGroup()
-        # action_ser_cbg = ReentrantCallbackGroup()
+        srv_ser_cbg = MutuallyExclusiveCallbackGroup()
         action_ser_cbg = MutuallyExclusiveCallbackGroup()
 
         normal_timer_cbg = MutuallyExclusiveCallbackGroup()
@@ -52,6 +53,9 @@ class NewOrderActionServer(Node):
 
         # Service clients
         self.new_order_cli = self.create_client(NewOrder, "new_order", callback_group=srv_cli_cbg)
+        self.pkg_order_cli = self.create_client(PackagingOrder, "packaging_order", callback_group=srv_cli_cbg)
+
+        self.sim_pkg_order_srv_ser = self.create_service(SimplifiedPackagingOrder, "simplified_packaging_order", self.pkg_pkg_cb, callback_group=srv_ser_cbg)
 
         # Action server
         self.new_order_action_ser = ActionServer(
@@ -145,6 +149,107 @@ class NewOrderActionServer(Node):
             for order_id in sent_to_remove:
                 self.order_sent.pop(order_id)
 
+    def pkg_pkg_cb(self, req, res):
+        try:
+            self.get_logger().info(f"{req}")
+            if self.send_pkg_req(req):
+                self.get_logger().info(f"Sent packaging order to manager")
+                res.success = True
+            else:
+                res.message = "Sent packaging order failed"
+        except Exception as e:
+            self.get_logger().error(f"Unexpected error in packaging order: {str(e)}")
+        finally:
+            return res
+
+    def send_pkg_req(self, req) -> Optional[bool]:
+        if not isinstance(req, SimplifiedPackagingOrder.Request):
+            raise TypeError(f"Expected Type SimplifiedPackagingOrder, got {type(order_id).__name__}")
+
+        order_id = req.order_id
+        
+        proc_order = self.pkg_order.get(order_id)
+        if proc_order is None:
+            raise ValueError(f"Order {order_id} not found")
+        
+        pkg_req = PackagingOrder.Request()
+        pkg_req.order_id = req.order_id
+        pkg_req.material_box_id = req.material_box_id
+        pkg_req.requester_id = 1234
+
+        MEAL_TIME = {
+            OrderRequest.MEAL_MORNING: "Morning",
+            OrderRequest.MEAL_NOON: "Noon",
+            OrderRequest.MEAL_AFTERNOON: "Afternoon",
+            OrderRequest.MEAL_EVENING: "Evening"
+        }
+
+        for i, info in enumerate(pkg_req.print_info):
+            if not proc_order.material_box.slots or i >= len(proc_order.material_box.slots):
+                continue
+            if not proc_order.material_box.slots[i].drugs:
+                continue
+
+            info.cn_name = proc_order.patient.institute_name
+            info.en_name  = proc_order.patient.name
+
+            curr_meal = (proc_order.start_meal + i) % 4
+            info.time = MEAL_TIME.get(curr_meal, "Unknown")
+
+            _date = proc_order.start_date
+            try:
+                dt = datetime.strptime(_date, "%Y-%m-%d")
+                self.get_logger().warning(f"dt: {dt}")
+                days_to_add = (proc_order.start_meal + i) // 4  # integer division
+                new_date = dt + timedelta(days=days_to_add)     # Add the days to the original datetime
+                self.get_logger().warning(f"new_date: {new_date}")
+                self.get_logger().warning(f"new_date.strftime('%Y-%m-%d'): {new_date.strftime('%Y-%m-%d')}")
+                info.date = f"Date: {new_date.strftime('%Y-%m-%d')}"
+            except ValueError as e:
+                info.date = "ERROR"
+                self.get_logger().error(f"Invalid date format for order {order_id}: {str(e)}")
+
+            info.qr_code = "https://www.hkclr.hk"
+
+            for drug in proc_order.material_box.slots[i].drugs:
+                drug_str = f"{drug.name}   {drug.amount}"
+                self.get_logger().info(f"Added to order {order_id}: {drug_str}")
+                info.drugs.append(drug_str)
+
+        while not self.pkg_order_cli.wait_for_service(timeout_sec=1.0):
+            if not rclpy.ok():
+                return None
+            self.get_logger().info("packaging_order Service not available, waiting again...")
+
+        try:
+            future = self.pkg_order_cli.call_async(pkg_req)
+            future.add_done_callback(partial(self.pkg_req_done_cb, order_id))
+            
+            return True
+        except AttributeError as e:
+            self.get_logger().error(f"Invalid service response for order id {order_id}: {str(e)}")
+            return False
+        except ValueError as e:
+            return False  
+        except Exception as e:
+            self.get_logger().error(f"Service call failed for order id {order_id}: {str(e)}")
+            return False
+
+    def pkg_req_done_cb(self, order_id: int, future) -> None:
+        res = future.result()
+
+        if res and res.success:
+            self.get_logger().info(f"Packaging request successful for order {order_id}")
+
+            order = self.pkg_order.pop(order_id)
+            if order:
+                self.get_logger().info(f"Removed the order in pkg_order: {order_id}")
+            else:
+                self.get_logger().info(f"Order not found in pkg_order: {order_id}")
+        else:         
+            self.get_logger().error(f"Packaging service failed for order {order_id}")
+
+
     # Action Server Callbacks
     def handle_accepted_cb(self, goal_handle):
         """Start or defer execution of an already accepted goal."""
@@ -180,6 +285,8 @@ class NewOrderActionServer(Node):
             req = goal.request
             result = NewOrderAction.Result()
             feedback_msg = NewOrderAction.Feedback()
+
+            self.pkg_order[req.order_id] = deepcopy(req)
             
             order_id = req.order_id
             priority = req.priority
