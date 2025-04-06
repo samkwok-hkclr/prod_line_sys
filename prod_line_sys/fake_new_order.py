@@ -29,6 +29,9 @@ def main(args=None):
     req.patient.name = "Sam Kwok"
     req.patient.institute_name = "HKCLR"
 
+    req.start_date = "2024-01-01"
+    req.start_meal = 0
+
     mtrl_box = MaterialBox()
 
     location_1 = DrugLocation()
@@ -58,7 +61,9 @@ def main(args=None):
     req.order_id = int(random.random()*1000000)
 
     req.material_box = mtrl_box
+    
     response = fake_new_order.send_request(req)
+
     fake_new_order.get_logger().info("sent!")
     fake_new_order.destroy_node()
     rclpy.shutdown()
