@@ -68,6 +68,7 @@ class CoreSystem(Node):
         self.elevator_request = deque()
         self.vision_request = deque()
         self.jack_up_queue = deque()
+        self.is_mtrl_box_storing: bool = False
 
         self.num_of_mtrl_box_in_container = 0
         self.pkg_mac_status: Dict[int, PackagingMachineStatus] = {} # pkg_mac_id, PackagingMachineStatus
@@ -351,6 +352,8 @@ class CoreSystem(Node):
         if state_changed:
             self.get_logger().info(f"Elevator state changed 0 -> 1 at {timestamp}. Queue size: {len(self.elevator_queue)}")
         elif msg.data != prev_elevator_ready:
+            with self.mutex:
+                self.is_mtrl_box_storing = False
             self.get_logger().debug(f"Elevator state changed 1 -> 0. Queue size: {len(self.elevator_queue)}")
 
     def qr_scan_cb(self, msg: CameraTrigger) -> None:
@@ -848,6 +851,8 @@ class CoreSystem(Node):
         if not status:
             self.get_logger().error(f"No material status found with order id: {order_id}")
             return
+        with self.mutex:
+            status.location = f"station_{station_id}"
         curr_sliding_platform = station.curr_sliding_platform
         cmd_sliding_platform = station.cmd_sliding_platform
         
@@ -1315,7 +1320,7 @@ class CoreSystem(Node):
             req_mtrl_box = proc.material_box
             mini_req_to_go = self.find_mini_req_to_go(req_mtrl_box)
 
-            self.get_logger().warning(f"Order {order_id}: Current stations {sorted(curr_gone)}, Required stations {sorted(req_to_go)}")
+            self.get_logger().warning(f"Order {order_id}: Current stations {sorted(curr_gone)}, Required stations {sorted(mini_req_to_go)}")
 
             return mini_req_to_go - curr_gone 
         except TimeoutError:
@@ -1626,7 +1631,8 @@ class CoreSystem(Node):
 
         # update location
         if status := self.mtrl_box_status.get(order_id):
-            status.location = str(camera_id)
+            with self.mutex:
+                status.location = f"camera_{camera_id}"
 
         decision = 0
         if available_stations:
@@ -1711,6 +1717,10 @@ class CoreSystem(Node):
         is_completed = True
         
         # FIXME: Wait the vision system complete
+        # update location
+        if status := self.mtrl_box_status.get(order_id):
+            with self.mutex:
+                status.location = f"camera_{camera_id}"
 
         remainder = set()
         if Const.MOVEMENT_VERSION == 1:
@@ -1752,6 +1762,9 @@ class CoreSystem(Node):
         status = self.mtrl_box_status.get(order_id)
         ready_to_pkg = False
         with self.mutex:
+            # update location
+            if status:
+                status.location = f"camera_{camera_id}"
             if status and status.status == MaterialBoxStatus.STATUS_AWAITING_PACKAGING:
                 ready_to_pkg = True
 
@@ -1789,14 +1802,19 @@ class CoreSystem(Node):
             bool: True if operation completed successfully, False otherwise
         """
         is_completed = False
-
-        elevator_success = False
+        elevator_req = False
 
         if self.is_releasing_mtrl_box:
             self.get_logger().debug(f"Skipped elevator movement for box {material_box_id} (currentlye releasing)")
 
         elif not self.is_elevator_ready:
             if status := self.mtrl_box_status.get(order_id):
+                # update location
+                with self.mutex:
+                    status.location = f"camera_{camera_id}"
+
+                elevator_req = True
+
                 # normal case
                 if status.status == MaterialBoxStatus.STATUS_PASS_TO_PACKAGING:
                     elevator_success = self._execute_movement(Const.TRANSFER_MTRL_BOX_ADDR, Const.MTRL_BOX_RETRIEVAL_PLC_VALUES)
@@ -1813,30 +1831,41 @@ class CoreSystem(Node):
                         self.get_logger().warning(f"Sent elevator request successfully")
                     else:
                         self.get_logger().error(f"Failed to write to register for elevator")
+
+                elevator_req = True
             else:
                 # store material box to container
-                block_success = self.send_income_mtrl_box(material_box_id)
-                if block_success:
-                    self.get_logger().warning(f"Sent a income materail box to packaging machine manager successfully")
-                else:
-                    self.get_logger().error(f"Failed to send the income materail box to packaging machine manager")
+                with self.mutex:
+                    storing = self.is_mtrl_box_storing
                 
-                elevator_success = self._execute_movement(Const.TRANSFER_MTRL_BOX_ADDR, Const.MTRL_BOX_RETRIEVAL_PLC_VALUES)
-                if elevator_success:
-                    self.get_logger().warning(f"Sent elevator request successfully")
+                if storing:
+                    is_completed = True
                 else:
-                    self.get_logger().error(f"Failed to write to register for elevator")
+                    with self.mutex:
+                        self.is_mtrl_box_storing = True
+                        
+                    block_success = self.send_income_mtrl_box(material_box_id)
+                    if block_success:
+                        self.get_logger().warning(f"Sent a income materail box to packaging machine manager successfully")
+                    else:
+                        self.get_logger().error(f"Failed to send the income materail box to packaging machine manager")
+                    
+                    elevator_success = self._execute_movement(Const.TRANSFER_MTRL_BOX_ADDR, Const.MTRL_BOX_RETRIEVAL_PLC_VALUES)
+                    if elevator_success:
+                        self.get_logger().warning(f"Sent elevator request successfully")
+                    else:
+                        self.get_logger().error(f"Failed to write to register for elevator")
+                    
+                    is_completed = block_success and elevator_success
+                    elevator_req = True
 
-                is_completed = block_success and elevator_success
-
-        with self.elevator_mutex:
-            if not any(req[0] == material_box_id for req in self.elevator_request):
-                self.elevator_request.append((material_box_id, self.get_clock().now()))
-                self.get_logger().info(f"appended to elevator request [{material_box_id}]")
+        if elevator_req:
+            with self.elevator_mutex:
+                if not any(req[0] == material_box_id for req in self.elevator_request):
+                    self.elevator_request.append((material_box_id, self.get_clock().now()))
+                    self.get_logger().info(f"appended to elevator request [{material_box_id}]")
 
         con_mtrl_box_success = self.send_con_mtrl_box(material_box_id)
-
-        # is_completed = True# elevator_success # and con_mtrl_box_success
 
         self.get_logger().info(f"Packaging machine 2 triggered for material box [{material_box_id}]")
         return is_completed
