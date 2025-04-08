@@ -28,6 +28,7 @@ setup(
             'fake_pkg_order_ser_node = prod_line_sys.fake_pkg_order_ser:main',
             'fake_rel_blk_ser_node = prod_line_sys.fake_rel_blk_ser:main',
             'fake_dis_station_node = prod_line_sys.fake_dis_station:main',
+            'fake_dis_client_node = prod_line_sys.fake_dis_cli:main',
         ],
     },
 )

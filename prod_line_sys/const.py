@@ -28,6 +28,10 @@ class Const:
     MOVEMENT_ADDR: Final[int] = 5000
     TRANSFER_MTRL_BOX_ADDR: Final[int] = 5200
     GO_OPPOSITE_ADDR: Final[int] = 5150
+    RELEASE_CLEANING_ADDR: Final[int] = 5420
+    RELEASE_VISION_ADDR: Final[int] = 5421
+
+    RELEASE_VALUE: Final[int] = [1]
 
     EXIT_JACK_UP_VALUE: Final[List] = [1]
     MOVE_OPPOSITE_VALUE: Final[List] = [2]
@@ -148,4 +152,6 @@ class Const:
         7: 65,
         8: 74,
     }
+    CLEANING_LOC_INDEX: Final[int] = 2
+    VISION_LOC_INDEX: Final[int] = 74
 

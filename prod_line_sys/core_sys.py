@@ -69,6 +69,14 @@ class CoreSystem(Node):
         self.vision_request = deque()
         self.jack_up_queue = deque()
         self.is_mtrl_box_storing: bool = False
+        self.jack_up_status: Dict[int, bool] = dict() # jack_up_pt, status
+        self.jack_up_exit_status: Dict[int, bool] = dict() # jack_up_pt, status
+
+        self.cleaning_state: bool = False
+        self.release_cleaning: bool = False
+
+        self.vision_state: bool = False
+        self.release_vision: bool = False
 
         self.num_of_mtrl_box_in_container = 0
         self.pkg_mac_status: Dict[int, PackagingMachineStatus] = {} # pkg_mac_id, PackagingMachineStatus
@@ -76,8 +84,6 @@ class CoreSystem(Node):
         # ROS2 client node, maybe unused
         self.test_cli_node = rclpy.create_node("test_cli_node")
         self.exec.add_node(self.test_cli_node)
-        self.jack_up_status: Dict[int, bool] = dict()
-        self.jack_up_exit_status: Dict[int, bool] = dict()
 
         # mutex
         self.mutex = Lock()
@@ -175,6 +181,8 @@ class CoreSystem(Node):
         self.init_vision_timer = self.create_timer(30.0, self.init_vision_cb, callback_group=init_vision_timer_cbg)
         self.jack_up_timer = self.create_timer(1.0, self.jack_up_cb, callback_group=jack_up_timer_cbg)
         self.occupancy_status_timer = self.create_timer(1.0, self.occupancy_status_cb, callback_group=normal_timer_cbg)
+        self.release_cleaning_timer = self.create_timer(1.0, self.release_cleaning_cb, callback_group=normal_timer_cbg)
+        self.release_vision_timer = self.create_timer(1.0, self.release_vision_cb, callback_group=normal_timer_cbg)
         self.clear_conveyor_occupancy_timer = self.create_timer(0.2, self.clear_conveyor_occupancy_cb, callback_group=clear_timer_cbg)
         self.dis_station_timers: Dict[int, rclpy.Timer.Timer] = dict()
         for i in range(1, Const.NUM_DISPENSER_STATIONS + 1):
@@ -454,6 +462,21 @@ class CoreSystem(Node):
         }
         self.get_logger().debug(f"station_status: {station_status}")
         self.get_logger().debug(f"conveyor_status: {conveyor_status}")
+        
+        with self.mutex:
+            prev_cleaning_state = self.cleaning_state
+            self.cleaning_state = sensor_data[Const.CLEANING_LOC_INDEX]
+
+            if sensor_data[Const.CLEANING_LOC_INDEX] and not prev_cleaning_state:
+                self.release_cleaning = True
+                self.get_logger().info(f"A material box is passing throught cleaning machine")
+
+            prev_vision_state = self.vision_state
+            self.vision_state = sensor_data[Const.VISION_LOC_INDEX]
+
+            if sensor_data[Const.VISION_LOC_INDEX] and not prev_vision_state:
+                self.release_vision = True
+                self.get_logger().info(f"A material box is passing throught vision inspection")
 
         try:
             acquired = self.occupy_mutex.acquire(timeout=self.MUTEX_TIMEOUT)
@@ -688,6 +711,57 @@ class CoreSystem(Node):
         self.get_logger().debug(f"Jack-up status data: {jack_up_status_msg.data}")
         self.get_logger().debug(f"Jack-up exit status data: {jack_up_exit_status_msg.data}")
     
+    def release_cleaning_cb(self) -> None:
+        self.get_logger().debug(f"Started to release the cleaning machine")
+
+        try:
+            acquired = self.mutex.acquire(timeout=self.MUTEX_TIMEOUT)
+            if not acquired:
+                self.get_logger().error("Failed to acquire mutex for clear conveyor occupancy")
+                return
+
+            if self.release_cleaning:
+                success = self._execute_movement(Const.RELEASE_CLEANING_ADDR, Const.RELEASE_VALUE)
+                if success:
+                    self.release_cleaning = False
+                    self.get_logger().debug(f"release the cleaning machine")
+                else:
+                    self.get_logger().error(f"write_registers movement failed")
+
+        except TimeoutError:
+            self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
+        except Exception as e:
+            self.get_logger().error(f"Error in occupancy status: {str(e)}")
+        finally:
+            if self.mutex.locked():
+                self.mutex.release()
+
+    def release_vision_cb(self) -> None:
+        self.get_logger().debug(f"Started to release the vision inspection")
+
+        try:
+            acquired = self.mutex.acquire(timeout=self.MUTEX_TIMEOUT)
+            if not acquired:
+                self.get_logger().error("Failed to acquire mutex for clear conveyor occupancy")
+                return
+                
+            if self.release_vision:
+                success = self._execute_movement(Const.RELEASE_VISION_ADDR, Const.RELEASE_VALUE)
+                if success:
+                    self.release_vision = False
+                    self.get_logger().debug(f"release the vision inspection")
+                else:
+                    self.get_logger().error(f"write_registers movement failed")
+        
+        except TimeoutError:
+            self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
+        except Exception as e:
+            self.get_logger().error(f"Error in occupancy status: {str(e)}")
+        finally:
+            if self.mutex.locked():
+                self.mutex.release()
+
+
     def clear_conveyor_occupancy_cb(self) -> None:
         self.get_logger().debug(f"Started to clear conveyor occupancy")
 
