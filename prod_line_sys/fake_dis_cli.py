@@ -47,10 +47,20 @@ class FakeDispenseClient(Node):
         }
 
         self.test_timer = self.create_timer(1.0, self.timer_cb, callback_group=MutuallyExclusiveCallbackGroup())
+        self.test_2_timer = self.create_timer(1.0, self.timer_2_cb, callback_group=MutuallyExclusiveCallbackGroup())
 
     def timer_cb(self) -> None:
         self.test_timer.cancel()
-        for i in range(1, 15):
+        for i in range(1, 2):
+            success = self.start_action(i)
+            if success:
+                self.get_logger().info(f"Station [{i}] service client is sent")
+            else:
+                self.get_logger().error(f"Station [{i}] service client is error")
+
+    def timer_2_cb(self) -> None:
+        self.test_2_timer.cancel()
+        for i in range(14, 15):
             success = self.start_action(i)
             if success:
                 self.get_logger().info(f"Station [{i}] service client is sent")

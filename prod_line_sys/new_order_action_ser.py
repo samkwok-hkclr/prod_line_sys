@@ -40,7 +40,7 @@ class NewOrderActionServer(Node):
         sub_cbg = MutuallyExclusiveCallbackGroup()
         srv_cli_cbg = MutuallyExclusiveCallbackGroup()
         srv_ser_cbg = MutuallyExclusiveCallbackGroup()
-        action_ser_cbg = MutuallyExclusiveCallbackGroup()
+        action_ser_cbg = ReentrantCallbackGroup()
 
         normal_timer_cbg = MutuallyExclusiveCallbackGroup()
 
@@ -295,7 +295,7 @@ class NewOrderActionServer(Node):
 
             feedback_msg.running = True
             retries = 0
-            MAX_RETRY = 600
+            MAX_RETRY = 600 # 3
 
             for _ in range(1, MAX_RETRY):
                 if not rclpy.ok():

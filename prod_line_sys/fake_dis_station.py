@@ -11,14 +11,14 @@ class FakeDispenserStation(Node):
         super().__init__(f"fake_dis_station_{station_id}")
         self.station_id = station_id
         self.sleep_rate = self.create_rate(1.0, self.get_clock())
-        self.srv = self.create_service(DispenseDrug, f"/dispenser_station_{station_id}/dispense_request", self.dis_drug_cb)
-        self.get_logger().info(f"/dispenser_station_{station_id}/dispense_request service server is started")
+        self.srv = self.create_service(DispenseDrug, f"/dispenser_station_{station_id}/fake_dispense_request", self.dis_drug_cb)
+        self.get_logger().info(f"/dispenser_station_{station_id}/fake_dispense_request service server is started")
 
     def dis_drug_cb(self, req, res):
-        self.get_logger().info(f"/dispenser_station_{self.station_id}/dispense_request service call received")
+        self.get_logger().info(f"/dispenser_station_{self.station_id}/fake_dispense_request service call received")
         self.sleep_rate.sleep()
         res.success = True
-        self.get_logger().info(f"/dispenser_station_{self.station_id}/dispense_request service call done")
+        self.get_logger().info(f"/dispenser_station_{self.station_id}/fake_dispense_request service call done")
         return res
 
 

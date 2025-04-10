@@ -64,11 +64,16 @@ class CoreSystem(Node):
         self.proc_order: Dict[int, OrderRequest] = {} # order_id, OrderRequest
         self.mtrl_box_status: Dict[int, MaterialBoxStatus] = {} # order_id, MaterialBoxStatus
         self.qr_scan: List[CameraTrigger] = []
-        self.elevator_queue = deque()
-        self.elevator_request = deque()
+
+        self.elevator_ready = deque() # append to this queue if elevator state from 0 -> 1, 
+        self.elevator_request = deque() # append a request if needed
+
         self.vision_request = deque()
+
         self.jack_up_queue = deque()
+
         self.is_mtrl_box_storing: bool = False
+
         self.jack_up_status: Dict[int, bool] = dict() # jack_up_pt, status
         self.jack_up_exit_status: Dict[int, bool] = dict() # jack_up_pt, status
 
@@ -85,7 +90,7 @@ class CoreSystem(Node):
         self.test_cli_node = rclpy.create_node("test_cli_node")
         self.exec.add_node(self.test_cli_node)
 
-        # mutex
+        # mutex, FIXME: very messy!!!
         self.mutex = Lock()
         self.occupy_mutex = Lock()
         self.qr_scan_mutex = Lock()
@@ -120,6 +125,8 @@ class CoreSystem(Node):
         station_srv_cli_cbgs = [MutuallyExclusiveCallbackGroup() for _ in range(Const.NUM_DISPENSER_STATIONS)]
 
         normal_timer_cbg = MutuallyExclusiveCallbackGroup()
+        occupancy_timer_cbg = MutuallyExclusiveCallbackGroup()
+        elevator_timer_cbg = MutuallyExclusiveCallbackGroup()
         qr_handle_timer_cbg = MutuallyExclusiveCallbackGroup()
         jack_up_timer_cbg = MutuallyExclusiveCallbackGroup()
         clear_timer_cbg = MutuallyExclusiveCallbackGroup()
@@ -177,13 +184,13 @@ class CoreSystem(Node):
         self.qr_handle_timer = self.create_timer(1.0, self.qr_handle_cb, callback_group=qr_handle_timer_cbg)
         self.start_order_timer = self.create_timer(1.0, self.start_order_cb, callback_group=normal_timer_cbg)
         self.order_status_timer = self.create_timer(1.0, self.order_status_cb, callback_group=normal_timer_cbg)
-        self.elevator_timer = self.create_timer(1.0, self.elevator_dequeue_cb, callback_group=normal_timer_cbg)
+        self.elevator_timer = self.create_timer(0.5, self.elevator_dequeue_cb, callback_group=elevator_timer_cbg)
         self.init_vision_timer = self.create_timer(30.0, self.init_vision_cb, callback_group=init_vision_timer_cbg)
         self.jack_up_timer = self.create_timer(1.0, self.jack_up_cb, callback_group=jack_up_timer_cbg)
-        self.occupancy_status_timer = self.create_timer(1.0, self.occupancy_status_cb, callback_group=normal_timer_cbg)
+        self.occupancy_status_timer = self.create_timer(1.0, self.occupancy_status_cb, callback_group=occupancy_timer_cbg)
         self.release_cleaning_timer = self.create_timer(1.0, self.release_cleaning_cb, callback_group=normal_timer_cbg)
         self.release_vision_timer = self.create_timer(1.0, self.release_vision_cb, callback_group=normal_timer_cbg)
-        self.clear_conveyor_occupancy_timer = self.create_timer(0.2, self.clear_conveyor_occupancy_cb, callback_group=clear_timer_cbg)
+        self.clear_conveyor_occupancy_timer = self.create_timer(0.1, self.clear_conveyor_occupancy_cb, callback_group=clear_timer_cbg)
         self.dis_station_timers: Dict[int, rclpy.Timer.Timer] = dict()
         for i in range(1, Const.NUM_DISPENSER_STATIONS + 1):
             cbg_index = int(i - 1)
@@ -349,20 +356,27 @@ class CoreSystem(Node):
             prev_elevator_ready = self.is_elevator_ready
             self.is_elevator_ready = msg.data
 
-            # Check for state transition (0 -> 1)
-            if msg.data and not prev_elevator_ready:
-                state_changed = True
-                self.elevator_queue.append(timestamp)
-                if self.elevator_request:
-                    mtrl_box_id, append_time = self.elevator_request.popleft()
-                    self.get_logger().info(f"popped out from elevator request [{mtrl_box_id}] w/ {append_time}")
+        # Check for state transition (0 -> 1)
+        if msg.data and not prev_elevator_ready:
+            state_changed = True
 
-        if state_changed:
-            self.get_logger().info(f"Elevator state changed 0 -> 1 at {timestamp}. Queue size: {len(self.elevator_queue)}")
+        if state_changed:            
+            self.elevator_ready.append(timestamp)
+            self.get_logger().info(f"appended to elevator ready queue [{timestamp}]")
+
+            if self.elevator_request:
+                mtrl_box_id, append_time = self.elevator_request.popleft()
+                self.get_logger().info(f"popped out from elevator request [{mtrl_box_id}] w/ {append_time}")
+
+            self.get_logger().info(f"Elevator state changed 0 -> 1 at {timestamp}. Queue size: {len(self.elevator_ready)}")
+
         elif msg.data != prev_elevator_ready:
             with self.mutex:
-                self.is_mtrl_box_storing = False
-            self.get_logger().debug(f"Elevator state changed 1 -> 0. Queue size: {len(self.elevator_queue)}")
+                if self.is_mtrl_box_storing:
+                    self.is_mtrl_box_storing = False
+                    self.get_logger().info(f"Reset is_mtrl_box_storing")
+                    
+            self.get_logger().info(f"Elevator state changed 1 -> 0. Queue size: {len(self.elevator_ready)}")
 
     def qr_scan_cb(self, msg: CameraTrigger) -> None:
         if not (Const.CAMERA_ID_START <= msg.camera_id <= Const.CAMERA_ID_END):
@@ -582,7 +596,7 @@ class CoreSystem(Node):
                 self.mutex.release()
 
     def elevator_dequeue_cb(self) -> None:
-        if self.is_releasing_mtrl_box or len(self.elevator_queue) == 0:
+        if self.is_releasing_mtrl_box or not self.elevator_ready:
             return
 
         success = self.send_rel_blocking()
@@ -595,6 +609,8 @@ class CoreSystem(Node):
         success = self.send_init_vision()
         if success:
             self.get_logger().info(f"Initiated the vision inspection system successfully")
+        else:
+            self.get_logger().error(f"Initiate the vision inspection system failure or timeout")
 
     def jack_up_cb(self) -> None:
         """
@@ -1495,6 +1511,9 @@ class CoreSystem(Node):
             self.get_logger().info("The conveyor segment is unavailable. Try to move out in the next callback")
             return False
         
+        conveyor_seg.occupy(mtrl_box_id)
+        self.get_logger().error(f">>>>> Conveyor Occupied: {conveyor_seg.id} by material box: {mtrl_box_id}")
+
         success = self._execute_movement(Const.MOVEMENT_ADDR + station_id, [Const.EXIT_STATION])
         if success:
             try:
@@ -1504,7 +1523,6 @@ class CoreSystem(Node):
                     self.get_logger().error("Failed to acquire mutex for occupy")
                     return False
                 
-                conveyor_seg.occupy(mtrl_box_id)
                 station.clear()
                 self.get_logger().info("locked done")
 
@@ -1516,9 +1534,11 @@ class CoreSystem(Node):
                 if self.occupy_mutex.locked():
                     self.occupy_mutex.release()
 
-            self.get_logger().error(f">>>>> Conveyor Occupied: {conveyor_seg.id} by material box: {mtrl_box_id}")
             self.get_logger().error(f">>>>> Station Released: {station.id}")
             return True
+        else:
+            conveyor_seg.clear()
+            self.get_logger().error(f">>>>> Conveyor Clear: {conveyor_seg.id} because failed to execute movement")
 
         self.get_logger().info(f"Failed to move out material box [{mtrl_box_id}] in station [{station_id}]")
         return False
@@ -1753,8 +1773,13 @@ class CoreSystem(Node):
             self.get_logger().warning(f"Go straight for camera {camera_id}")
 
             if next_conveyor and next_conveyor.available():
+                if camera_id != 8:
+                    next_conveyor.occupy(material_box_id)
+                    self.get_logger().error(f">>>>> Conveyor Occupied: {next_conveyor.id} by material box: {material_box_id}")
+
                 success = self._execute_movement(register_addr, Const.STRAIGHT_VALUE)
                 if not success:
+                    next_conveyor.clear()
                     self.get_logger().error(f"Failed to write to register {register_addr}")
                     return False
                 
@@ -1766,8 +1791,6 @@ class CoreSystem(Node):
                             self.get_logger().error("Failed to acquire mutex for occupy")
                             return False
                         
-                        if camera_id != 8:
-                            next_conveyor.occupy(material_box_id)
                         # curr_conveyor.clear()
 
                     except TimeoutError:
@@ -1788,6 +1811,8 @@ class CoreSystem(Node):
         return is_completed
     
     def camera_9_action(self, order_id: int, material_box_id: int, camera_id: int) -> Optional[bool]:
+        self.get_logger().info(f"Vision inspection triggered for material box [{material_box_id}]")
+
         is_completed = True
         
         # FIXME: Wait the vision system complete
@@ -1808,12 +1833,11 @@ class CoreSystem(Node):
             self.get_logger().info(f"added to vision inspection request order id [{order_id}]")
             status = self.mtrl_box_status.get(order_id)
 
-            # FIXME: force to set the status
+            # FIXME: force to set the status because the vision inspection does not ready
             with self.mutex:
                 if status:
                     status.status = MaterialBoxStatus.STATUS_AWAITING_PACKAGING
 
-        self.get_logger().info(f"Vision inspection triggered for material box [{material_box_id}]")
         return is_completed
         
     def camera_10_action(self, order_id: int, material_box_id: int, camera_id: int) -> Optional[bool]:
@@ -1827,8 +1851,10 @@ class CoreSystem(Node):
         Returns:
             bool: True if operation completed successfully, False otherwise
         """
+        self.get_logger().info(f"Packaging machine 1 triggered for material box [{material_box_id}]")    
 
         is_completed = False
+        pkg_req_success = False
 
         # FIXME: No need to find reminder if vision inspection is done
         # remainder = self.find_remainder(order_id)
@@ -1842,25 +1868,22 @@ class CoreSystem(Node):
             if status and status.status == MaterialBoxStatus.STATUS_AWAITING_PACKAGING:
                 ready_to_pkg = True
 
-        # if len(remainder) == 0 and self.get_any_pkc_mac_is_idle():
         if ready_to_pkg and self.get_any_pkc_mac_is_idle():
             pkg_req_success = self.send_pkg_req(order_id)
             if pkg_req_success:
                 self.get_logger().warning(f"Sent a packaging request to packaging machine manager successfully")
                 self.get_logger().warning(f"Removed the order in the proc_order successfully")
-                is_completed = True
             else:
                 self.get_logger().error(f"Failed to send the packaging request to packaging machine manager") 
+        
+        block_success = self.send_income_mtrl_box(material_box_id)
+        if block_success:
+            self.get_logger().warning(f"Sent a income materail box to packaging machine manager successfully")
         else:
-            block_success = self.send_income_mtrl_box(material_box_id)
-            if block_success:
-                self.get_logger().warning(f"Sent a income materail box to packaging machine manager successfully")
-            else:
-                self.get_logger().error(f"Failed to send the income materail box to packaging machine manager")
+            self.get_logger().error(f"Failed to send the income materail box to packaging machine manager")
 
-            is_completed = block_success
+        is_completed = pkg_req_success and block_success
 
-        self.get_logger().info(f"Packaging machine 1 triggered for material box [{material_box_id}]")    
         return is_completed
     
     def camera_11_action(self, order_id: int, material_box_id: int, camera_id: int) -> Optional[bool]:
@@ -1875,63 +1898,65 @@ class CoreSystem(Node):
         Returns:
             bool: True if operation completed successfully, False otherwise
         """
+        self.get_logger().info(f"Packaging machine 2 triggered for material box [{material_box_id}]")
+
         is_completed = False
         elevator_req = False
 
         if self.is_releasing_mtrl_box:
-            self.get_logger().debug(f"Skipped elevator movement for box {material_box_id} (currentlye releasing)")
+            self.get_logger().debug(f"Skipped elevator movement for box {material_box_id} (currently releasing box)")
+            return is_completed
 
-        elif not self.is_elevator_ready:
-            if status := self.mtrl_box_status.get(order_id):
-                # update location
-                with self.mutex:
-                    status.location = f"camera_{camera_id}"
+        # elif not self.is_elevator_ready:
+        if status := self.mtrl_box_status.get(order_id):
+            # update location
+            with self.mutex:
+                status.location = f"camera_{camera_id}"
 
-                elevator_req = True
-
-                # normal case
-                if status.status == MaterialBoxStatus.STATUS_PASS_TO_PACKAGING:
-                    elevator_success = self._execute_movement(Const.TRANSFER_MTRL_BOX_ADDR, Const.MTRL_BOX_RETRIEVAL_PLC_VALUES)
-                    if elevator_success:
-                        if popped_status := self.mtrl_box_status.pop(order_id):
-                            is_completed = True
-                        self.get_logger().warning(f"Sent elevator request successfully")
-                    else:
-                        self.get_logger().error(f"Failed to write to register for elevator")
-                else:
-                    elevator_success = self._execute_movement(Const.TRANSFER_MTRL_BOX_ADDR, Const.MTRL_BOX_BYPASS_PLC_VALUES)
-                    if elevator_success:
+            # normal case
+            if status.status == MaterialBoxStatus.STATUS_PASS_TO_PACKAGING:
+                elevator_success = self._execute_movement(Const.TRANSFER_MTRL_BOX_ADDR, Const.MTRL_BOX_RETRIEVAL_PLC_VALUES)
+                if elevator_success:
+                    if popped_status := self.mtrl_box_status.pop(order_id):
                         is_completed = True
-                        self.get_logger().warning(f"Sent elevator request successfully")
-                    else:
-                        self.get_logger().error(f"Failed to write to register for elevator")
-
-                elevator_req = True
-            else:
-                # store material box to container
-                with self.mutex:
-                    storing = self.is_mtrl_box_storing
-                
-                if storing:
-                    is_completed = True
+                    self.get_logger().warning(f"Sent elevator request successfully")
                 else:
-                    with self.mutex:
-                        self.is_mtrl_box_storing = True
-                        
-                    block_success = self.send_income_mtrl_box(material_box_id)
-                    if block_success:
-                        self.get_logger().warning(f"Sent a income materail box to packaging machine manager successfully")
-                    else:
-                        self.get_logger().error(f"Failed to send the income materail box to packaging machine manager")
+                    self.get_logger().error(f"Failed to write to register for elevator")
+            else:
+                elevator_success = self._execute_movement(Const.TRANSFER_MTRL_BOX_ADDR, Const.MTRL_BOX_BYPASS_PLC_VALUES)
+                if elevator_success:
+                    is_completed = True
+                    self.get_logger().warning(f"Sent elevator request successfully")
+                else:
+                    self.get_logger().error(f"Failed to write to register for elevator")
+
+            elevator_req = True
+        else:
+            # store material box to container
+            with self.mutex:
+                storing = self.is_mtrl_box_storing
+            
+            if storing:
+                is_completed = True
+            else:
+                with self.mutex:
+                    self.is_mtrl_box_storing = True
+                    self.get_logger().info(f"Set is_mtrl_box_storing")
                     
-                    elevator_success = self._execute_movement(Const.TRANSFER_MTRL_BOX_ADDR, Const.MTRL_BOX_RETRIEVAL_PLC_VALUES)
-                    if elevator_success:
-                        self.get_logger().warning(f"Sent elevator request successfully")
-                    else:
-                        self.get_logger().error(f"Failed to write to register for elevator")
-                    
-                    is_completed = block_success and elevator_success
-                    elevator_req = True
+                block_success = self.send_income_mtrl_box(material_box_id)
+                if block_success:
+                    self.get_logger().warning(f"Sent a income materail box to packaging machine manager successfully")
+                else:
+                    self.get_logger().error(f"Failed to send the income materail box to packaging machine manager")
+                
+                elevator_success = self._execute_movement(Const.TRANSFER_MTRL_BOX_ADDR, Const.MTRL_BOX_RETRIEVAL_PLC_VALUES)
+                if elevator_success:
+                    self.get_logger().warning(f"Sent elevator request successfully")
+                else:
+                    self.get_logger().error(f"Failed to write to register for elevator")
+                
+                is_completed = block_success and elevator_success
+                elevator_req = True
 
         if elevator_req:
             with self.elevator_mutex:
@@ -1941,13 +1966,12 @@ class CoreSystem(Node):
 
         con_mtrl_box_success = self.send_con_mtrl_box(material_box_id)
 
-        self.get_logger().info(f"Packaging machine 2 triggered for material box [{material_box_id}]")
         return is_completed
     
     def send_init_vision(self)-> Optional[bool]:
         MAX_RETIES = 3
         reties = 0
-        while not self.init_vision_cli.wait_for_service(timeout_sec=0.1):
+        while not self.init_vision_cli.wait_for_service(timeout_sec=0.05):
             if not rclpy.ok() or reties >= MAX_RETIES:
                 return None
             reties += 1
@@ -2279,7 +2303,7 @@ class CoreSystem(Node):
 
         MAX_RETIES = 3
         reties = 0
-        while not self.visual_action_cli.wait_for_server(timeout_sec=0.1):
+        while not self.visual_action_cli.wait_for_server(timeout_sec=0.05):
             if not rclpy.ok() or reties >= MAX_RETIES:
                 return None
             reties += 1
@@ -2313,10 +2337,12 @@ class CoreSystem(Node):
         res = future.result()
 
         if res and res.success:
+            tmp = None
             with self.elevator_mutex:   
-                if self.elevator_queue:
-                    self.elevator_queue.popleft()
-                    self.get_logger().info(f"Removed from elevator_queue successfully")
+                if self.elevator_ready:
+                    tmp = self.elevator_ready.popleft()
+            if tmp:
+                self.get_logger().info(f"Removed from elevator_queue successfully")
 
             self.get_logger().info(f"Sent the release blocking successfully")
         else:
@@ -2456,6 +2482,7 @@ class CoreSystem(Node):
         self.conveyor.append(9) # Vision
         self.conveyor.append(10) # Packaging Machine 1
         self.conveyor.append(11) # Packaging Machine 2
+
         self.get_logger().info(f"\n{self.conveyor}")
 
     def _get_dis_station_cli(self, station_id: int) -> Optional[rclpy.client.Client]:
