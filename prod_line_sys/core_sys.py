@@ -57,13 +57,16 @@ class CoreSystem(Node):
         self.exec = executor
 
         self.MUTEX_TIMEOUT: Final[float] = 1.0
+        self.MAX_HISTORY_AGE_SEC: Final[float] = 30.0
 
         # FIXME: try to save in database later
         # Local memory storage, 
         self.recv_order = deque()
         self.proc_order: Dict[int, OrderRequest] = {} # order_id, OrderRequest
         self.mtrl_box_status: Dict[int, MaterialBoxStatus] = {} # order_id, MaterialBoxStatus
+        
         self.qr_scan: List[CameraTrigger] = []
+        self.qr_scan_history = deque(maxlen=100)
 
         self.elevator_ready = deque() # append to this queue if elevator state from 0 -> 1, 
         self.elevator_request = deque() # append a request if needed
@@ -182,6 +185,7 @@ class CoreSystem(Node):
 
         # Timers
         self.qr_handle_timer = self.create_timer(1.0, self.qr_handle_cb, callback_group=qr_handle_timer_cbg)
+        self.qr_history_timer = self.create_timer(1.0, self.qr_history_cb, callback_group=qr_handle_timer_cbg)
         self.start_order_timer = self.create_timer(1.0, self.start_order_cb, callback_group=normal_timer_cbg)
         self.order_status_timer = self.create_timer(1.0, self.order_status_cb, callback_group=normal_timer_cbg)
         self.elevator_timer = self.create_timer(0.5, self.elevator_dequeue_cb, callback_group=elevator_timer_cbg)
@@ -387,21 +391,18 @@ class CoreSystem(Node):
             return
         
         with self.qr_scan_mutex:
-            if not self.qr_scan:
+            found = any(
+                scan.camera_id == msg.camera_id and scan.material_box_id == msg.material_box_id
+                for scan, _ in self.qr_scan_history
+            )
+            
+            if not found:
+                self.qr_scan_history.append((msg, self.get_clock().now()))
                 self.qr_scan.append(msg)
-                self.get_logger().info(f"Camera {msg.camera_id} box [{msg.material_box_id}] is append to qr_scan [Empty]")
-            else:
-                found = False
-                for scan in self.qr_scan:
-                    if scan.camera_id == msg.camera_id and scan.material_box_id == msg.material_box_id:
-                        found = True
-                        self.get_logger().info(f"Camera {msg.camera_id} repeated the scan with box [{msg.material_box_id}]")
-                        break
-                if not found:
-                    self.qr_scan.append(msg)
-                    self.get_logger().info(f"Camera {msg.camera_id} box [{msg.material_box_id}] is append to qr_scan")
-        
+                self.get_logger().info(f"Camera {msg.camera_id} box [{msg.material_box_id}] is append to qr_scan")
+
         self.get_logger().debug(f"Received CameraTrigger message: camera_id={msg.camera_id}, material_box_id={msg.material_box_id}")
+
 
     def pkg_mac_status_cb(self, msg: PackagingMachineStatus) -> None:
         """
@@ -656,7 +657,7 @@ class CoreSystem(Node):
                 elif Const.MOVEMENT_VERSION == 2:
                     remainder = self.find_mini_remainder(order_id)
 
-                if len(remainder) == 0:
+                if remainder and len(remainder) == 0:
                     if status := self.mtrl_box_status.get(order_id):
                         status.status = MaterialBoxStatus.STATUS_DISPENSED
                         self.get_logger().warning(f"set order id {order_id} status to STATUS_DISPENSED")
@@ -916,6 +917,24 @@ class CoreSystem(Node):
                 self.get_logger().info(f"Removed message camera id: {msg.camera_id}, box: {msg.material_box_id} ")
 
         self.get_logger().info(f"Completed to handle the QR scan")
+
+    def qr_history_cb(self) -> None:
+        curr_time = self.get_clock().now()
+        
+        with self.qr_scan_mutex:
+            len_befoce = len(self.qr_scan_history)
+
+            self.qr_scan_history = deque(
+                (scan, scan_time) for scan, scan_time in self.qr_scan_history
+                if (curr_time - scan_time).nanoseconds / 1e9 <= self.MAX_HISTORY_AGE_SEC
+            )
+
+            len_after = len(self.qr_scan_history)
+
+        diff = len_befoce - len_after
+        if diff > 0:
+            self.get_logger().info(f"Number of camera history scan is removed: {diff} ")
+
 
     def station_decision_cb(self, station_id: int) -> None:
         self.get_logger().debug(f"Dispenser Station [{station_id}] callback is called")
@@ -1828,7 +1847,7 @@ class CoreSystem(Node):
             remainder = self.find_mini_remainder(order_id)
         self.get_logger().info(f"in camera 9 remainder: {remainder}")
         
-        if len(remainder) == 0:
+        if remainder and len(remainder) == 0:
             self.vision_request.append(order_id)
             self.get_logger().info(f"added to vision inspection request order id [{order_id}]")
             status = self.mtrl_box_status.get(order_id)
@@ -1871,6 +1890,7 @@ class CoreSystem(Node):
         if ready_to_pkg and self.get_any_pkc_mac_is_idle():
             pkg_req_success = self.send_pkg_req(order_id)
             if pkg_req_success:
+                is_completed = True
                 self.get_logger().warning(f"Sent a packaging request to packaging machine manager successfully")
                 self.get_logger().warning(f"Removed the order in the proc_order successfully")
             else:
@@ -1878,11 +1898,12 @@ class CoreSystem(Node):
         
         block_success = self.send_income_mtrl_box(material_box_id)
         if block_success:
+            is_completed = True
             self.get_logger().warning(f"Sent a income materail box to packaging machine manager successfully")
         else:
             self.get_logger().error(f"Failed to send the income materail box to packaging machine manager")
 
-        is_completed = pkg_req_success and block_success
+        is_completed = is_completed and block_success
 
         return is_completed
     
