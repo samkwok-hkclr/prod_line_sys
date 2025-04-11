@@ -57,23 +57,22 @@ class CoreSystem(Node):
         self.exec = executor
 
         self.MUTEX_TIMEOUT: Final[float] = 1.0
-        self.MAX_HISTORY_AGE_SEC: Final[float] = 30.0
+        self.MAX_HISTORY_AGE_SEC: Final[float] = 120.0
 
-        # FIXME: try to save in database later
-        # Local memory storage, 
-        self.recv_order = deque()
+        # Local memory storage
+        self.recv_order = deque(maxlen=32)
         self.proc_order: Dict[int, OrderRequest] = {} # order_id, OrderRequest
         self.mtrl_box_status: Dict[int, MaterialBoxStatus] = {} # order_id, MaterialBoxStatus
         
         self.qr_scan: List[CameraTrigger] = []
-        self.qr_scan_history = deque(maxlen=100)
+        self.qr_scan_history = deque(maxlen=32)
 
-        self.elevator_ready = deque() # append to this queue if elevator state from 0 -> 1, 
-        self.elevator_request = deque() # append a request if needed
+        self.elevator_ready = deque(maxlen=32) # append to this queue if elevator state from 0 -> 1, 
+        self.elevator_request = deque(maxlen=32) # append a request if needed
 
-        self.vision_request = deque()
+        self.vision_request = deque(maxlen=32)
 
-        self.jack_up_queue = deque()
+        self.jack_up_queue = deque(maxlen=32)
 
         self.is_mtrl_box_storing: bool = False
 
@@ -657,10 +656,12 @@ class CoreSystem(Node):
                 elif Const.MOVEMENT_VERSION == 2:
                     remainder = self.find_mini_remainder(order_id)
 
-                if remainder and len(remainder) == 0:
+                self.get_logger().info(f"In jack-up point 8 remainder: {remainder}")
+                if remainder is not None and len(remainder) == 0:
                     if status := self.mtrl_box_status.get(order_id):
                         status.status = MaterialBoxStatus.STATUS_DISPENSED
-                        self.get_logger().warning(f"set order id {order_id} status to STATUS_DISPENSED")
+                        # FIXME
+                        self.get_logger().warning(f"updated status to STATUS_DISPENSED w/ box [FIXME]") # {material_box_id}
 
         for item in to_remove:
             self.jack_up_queue.remove(item)
@@ -999,7 +1000,7 @@ class CoreSystem(Node):
             
         elif filtered_missing:
             self.get_logger().debug(f"try to dispense")
-            success = self.dispense_action(station, station_id, filtered_missing[0], order, target_cell)
+            success = self.dispense_action(station, station_id, filtered_missing, order, target_cell)
 
         self.get_logger().debug(f"The station {[station_id]} decision are made!!")
 
@@ -1839,15 +1840,17 @@ class CoreSystem(Node):
         if status := self.mtrl_box_status.get(order_id):
             with self.mutex:
                 status.location = f"camera_{camera_id}"
+            self.get_logger().info(f"updated location to camera_{camera_id} w/ box [{material_box_id}]")
 
         remainder = set()
         if Const.MOVEMENT_VERSION == 1:
             remainder = self.find_remainder(order_id)
         elif Const.MOVEMENT_VERSION == 2:
             remainder = self.find_mini_remainder(order_id)
+
         self.get_logger().info(f"in camera 9 remainder: {remainder}")
         
-        if remainder and len(remainder) == 0:
+        if remainder is not None and len(remainder) == 0:
             self.vision_request.append(order_id)
             self.get_logger().info(f"added to vision inspection request order id [{order_id}]")
             status = self.mtrl_box_status.get(order_id)
@@ -1856,6 +1859,7 @@ class CoreSystem(Node):
             with self.mutex:
                 if status:
                     status.status = MaterialBoxStatus.STATUS_AWAITING_PACKAGING
+            self.get_logger().info(f"updated status to STATUS_AWAITING_PACKAGING w/ box [{material_box_id}]")
 
         return is_completed
         
@@ -1886,6 +1890,7 @@ class CoreSystem(Node):
                 status.location = f"camera_{camera_id}"
             if status and status.status == MaterialBoxStatus.STATUS_AWAITING_PACKAGING:
                 ready_to_pkg = True
+        self.get_logger().info(f"updated location to camera_{camera_id} w/ box [{material_box_id}]")
 
         if ready_to_pkg and self.get_any_pkc_mac_is_idle():
             pkg_req_success = self.send_pkg_req(order_id)
@@ -1895,15 +1900,13 @@ class CoreSystem(Node):
                 self.get_logger().warning(f"Removed the order in the proc_order successfully")
             else:
                 self.get_logger().error(f"Failed to send the packaging request to packaging machine manager") 
-        
-        block_success = self.send_income_mtrl_box(material_box_id)
-        if block_success:
-            is_completed = True
-            self.get_logger().warning(f"Sent a income materail box to packaging machine manager successfully")
         else:
-            self.get_logger().error(f"Failed to send the income materail box to packaging machine manager")
-
-        is_completed = is_completed and block_success
+            block_success = self.send_income_mtrl_box(material_box_id)
+            if block_success:
+                is_completed = True
+                self.get_logger().warning(f"Sent a income materail box to packaging machine manager successfully")
+            else:
+                self.get_logger().error(f"Failed to send the income materail box to packaging machine manager")
 
         return is_completed
     
@@ -1940,20 +1943,20 @@ class CoreSystem(Node):
                 if elevator_success:
                     if popped_status := self.mtrl_box_status.pop(order_id):
                         is_completed = True
-                    self.get_logger().warning(f"Sent elevator request successfully")
+                    self.get_logger().warning(f"Sent elevator request (retrieval) successfully")
                 else:
                     self.get_logger().error(f"Failed to write to register for elevator")
             else:
                 elevator_success = self._execute_movement(Const.TRANSFER_MTRL_BOX_ADDR, Const.MTRL_BOX_BYPASS_PLC_VALUES)
                 if elevator_success:
                     is_completed = True
-                    self.get_logger().warning(f"Sent elevator request successfully")
+                    self.get_logger().warning(f"Sent elevator request (passby) successfully")
                 else:
                     self.get_logger().error(f"Failed to write to register for elevator")
 
             elevator_req = True
         else:
-            # store material box to container
+            # store material box to container for unbound material box
             with self.mutex:
                 storing = self.is_mtrl_box_storing
             
@@ -1972,7 +1975,7 @@ class CoreSystem(Node):
                 
                 elevator_success = self._execute_movement(Const.TRANSFER_MTRL_BOX_ADDR, Const.MTRL_BOX_RETRIEVAL_PLC_VALUES)
                 if elevator_success:
-                    self.get_logger().warning(f"Sent elevator request successfully")
+                    self.get_logger().warning(f"Sent elevator request (retrieval) successfully")
                 else:
                     self.get_logger().error(f"Failed to write to register for elevator")
                 
@@ -2004,6 +2007,7 @@ class CoreSystem(Node):
             future = self.init_vision_cli.call_async(req)
             future.add_done_callback(self.init_vision_done_cb)
 
+            self.get_logger().info("init_vision_cli is called, waiting for future done")
             return True
         except AttributeError as e:
             self.get_logger().error(f"Invalid service response: {str(e)}")
@@ -2024,6 +2028,7 @@ class CoreSystem(Node):
             future = self.rel_blocking_cli.call_async(req)
             future.add_done_callback(self.elevator_dequeue_done_cb)
 
+            self.get_logger().info("rel_blocking_cli is called, waiting for future done")
             return True
         except AttributeError as e:
             self.get_logger().error(f"Invalid service response: {str(e)}")
@@ -2063,6 +2068,7 @@ class CoreSystem(Node):
             future = self.income_mtrl_box_cli.call_async(req)
             future.add_done_callback(partial(self.income_mtrl_box_done_cb, mtrl_box_id))
 
+            self.get_logger().info("income_mtrl_box_cli is called, waiting for future done")
             return True
         except AttributeError as e:
             self.get_logger().error(f"Invalid service response for ID {mtrl_box_id}: {str(e)}")
@@ -2141,6 +2147,7 @@ class CoreSystem(Node):
             future = self.pkg_order_cli.call_async(req)
             future.add_done_callback(partial(self.pkg_req_done_cb, order_id))
             
+            self.get_logger().info("pkg_order_cli is called, waiting for future done")
             return True
         except AttributeError as e:
             self.get_logger().error(f"Invalid service response for order id {order_id}: {str(e)}")
@@ -2197,8 +2204,9 @@ class CoreSystem(Node):
         
         req = DispenseDrug.Request()
         for item in filtered_missing:
-            req.content.append(DispenseContent(unit_id=item[1], amount=item[2]))
-        self.get_logger().debug(f"DispenseDrug.Request: {req}")
+            req.content.append(DispenseContent(unit_id=item[0][1], amount=item[0][2]))
+        self.get_logger().info(f"filtered_missing length: {len(filtered_missing)}")
+        self.get_logger().info(f"DispenseDrug.Request: {req}")
 
         while not self._get_dis_station_cli(station_id).wait_for_service(timeout_sec=1.0):
             if not rclpy.ok():
@@ -2362,8 +2370,10 @@ class CoreSystem(Node):
             with self.elevator_mutex:   
                 if self.elevator_ready:
                     tmp = self.elevator_ready.popleft()
-            if tmp:
+            if tmp is not None:
                 self.get_logger().info(f"Removed from elevator_queue successfully")
+            else:
+                self.get_logger().info(f"elevator_ready popleft failed")
 
             self.get_logger().info(f"Sent the release blocking successfully")
         else:
@@ -2394,6 +2404,7 @@ class CoreSystem(Node):
             if status := self.mtrl_box_status.get(order_id):
                 with self.mutex:
                     status.status = MaterialBoxStatus.STATUS_PASS_TO_PACKAGING
+                self.get_logger().info(f"Updated status to STATUS_PASS_TO_PACKAGING") # w/ box [{mtrl_box_id}]
 
             order = self.proc_order.pop(order_id)
             if order:
@@ -2417,8 +2428,8 @@ class CoreSystem(Node):
                     for item in filtered_missing: 
                         new_detail = DispensingDetail()
                         new_detail.location.dispenser_station = station_id
-                        new_detail.location.dispenser_unit = item[1]
-                        new_detail.amount = item[2]
+                        new_detail.location.dispenser_unit = item[0][1]
+                        new_detail.amount = item[0][2]
                         try:
                             status.material_box.slots[cell_no].dispensing_detail.append(new_detail)
                         except Exception as e:
