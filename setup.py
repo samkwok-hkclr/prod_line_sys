@@ -22,7 +22,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'core_sys_node = prod_line_sys.core_sys:main',
+            'bringup_node = prod_line_sys.bringup:main',
             'new_order_action_ser_node = prod_line_sys.new_order_action_ser:main',
             'fake_new_order_node = prod_line_sys.fake_new_order:main',
             'fake_pkg_order_ser_node = prod_line_sys.fake_pkg_order_ser:main',

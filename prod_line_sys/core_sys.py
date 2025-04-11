@@ -3,7 +3,7 @@ import time
 import asyncio
 from asyncio import run_coroutine_threadsafe
 from collections import deque
-from threading import Thread, Lock, Condition
+from threading import Thread, Lock
 from typing import Dict, List, Set, Tuple, Optional, Final
 from array import array
 from copy import copy, deepcopy
@@ -15,7 +15,6 @@ import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
-from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 
 from action_msgs.msg import GoalStatus
 from std_msgs.msg import Bool, UInt8, UInt8MultiArray
@@ -33,10 +32,8 @@ from smdps_msgs.msg import (CameraState,
                             OrderResponse,
                             MaterialBox,
                             PackagingMachineStatus,
-                            PackageInfo,
                             DispenseContent,
-                            DispensingDetail,
-                            DrugLocation)
+                            DispensingDetail)
 from smdps_msgs.srv import (NewOrder, 
                             ReadRegister, 
                             WriteRegister, 
@@ -46,7 +43,6 @@ from smdps_msgs.srv import (NewOrder,
                             UInt8 as UInt8Srv)
 
 from .dispenser_station import DispenserStation
-from .conveyor_segment import ConveyorSegment
 from .conveyor import Conveyor
 from .const import Const
 from .pkg_info import PkgInfo
@@ -132,7 +128,6 @@ class CoreSystem(Node):
         qr_handle_timer_cbg = MutuallyExclusiveCallbackGroup()
         jack_up_timer_cbg = MutuallyExclusiveCallbackGroup()
         clear_timer_cbg = MutuallyExclusiveCallbackGroup()
-        init_vision_timer_cbg = MutuallyExclusiveCallbackGroup()
         station_timer_cbgs = [MutuallyExclusiveCallbackGroup() for _ in range(Const.NUM_DISPENSER_STATIONS)]
         self.get_logger().info("Callback groups are created")
 
@@ -166,9 +161,7 @@ class CoreSystem(Node):
         # Service clients
         self.read_cli = self.create_client(ReadRegister, "read_register", callback_group=srv_cli_cbg)
         self.write_cli = self.create_client(WriteRegister, "write_register", callback_group=srv_cli_cbg)
-        self.init_vision_cli = self.create_client(Trigger, "init_visual_camera", callback_group=srv_cli_cbg)
         self.income_mtrl_box_cli = self.create_client(UInt8Srv, "income_material_box", callback_group=srv_cli_cbg)
-        self.con_mtrl_box_cli = self.create_client(UInt8Srv, "container_material_box", callback_group=srv_cli_cbg)
         self.rel_blocking_cli = self.create_client(Trigger, "release_blocking", callback_group=srv_cli_cbg)
         self.pkg_order_cli = self.create_client(PackagingOrder, "packaging_order", callback_group=srv_cli_cbg)
         self.dis_station_clis: Dict[int, rclpy.client.Client] = dict() # station_id, Client
@@ -188,7 +181,6 @@ class CoreSystem(Node):
         self.start_order_timer = self.create_timer(1.0, self.start_order_cb, callback_group=normal_timer_cbg)
         self.order_status_timer = self.create_timer(1.0, self.order_status_cb, callback_group=normal_timer_cbg)
         self.elevator_timer = self.create_timer(0.5, self.elevator_dequeue_cb, callback_group=elevator_timer_cbg)
-        self.init_vision_timer = self.create_timer(30.0, self.init_vision_cb, callback_group=init_vision_timer_cbg)
         self.jack_up_timer = self.create_timer(1.0, self.jack_up_cb, callback_group=jack_up_timer_cbg)
         self.occupancy_status_timer = self.create_timer(1.0, self.occupancy_status_cb, callback_group=occupancy_timer_cbg)
         self.release_cleaning_timer = self.create_timer(1.0, self.release_cleaning_cb, callback_group=normal_timer_cbg)
@@ -304,7 +296,6 @@ class CoreSystem(Node):
             self.get_logger().error(f"Invalid message format: {e}")
         except Exception as e:
             self.get_logger().error(f"Error processing sliding platform ready message: {e}")
-        return
 
     def sliding_platform_ready_cb(self, msg: UInt8MultiArray) -> None:
         """
@@ -329,7 +320,7 @@ class CoreSystem(Node):
                     station.is_platform_ready = platform_ready_state
                 updated_stations.append((station_id, platform_ready_state))
 
-                if station.is_platform_ready != 0:
+                if platform_ready_state != 0:
                     self.get_logger().debug(f"Station [{station_id}] platform is ready!")
             
             if updated_stations:
@@ -342,7 +333,6 @@ class CoreSystem(Node):
             self.get_logger().error(f"Invalid message format: {e}")
         except Exception as e:
             self.get_logger().error(f"Error processing sliding platform ready message: {e}")
-        return
     
     def elevator_cb(self, msg: Bool) -> None:
         """
@@ -363,13 +353,15 @@ class CoreSystem(Node):
         if msg.data and not prev_elevator_ready:
             state_changed = True
 
-        if state_changed:            
-            self.elevator_ready.append(timestamp)
+        if state_changed:   
+            with self.elevator_mutex:         
+                self.elevator_ready.append(timestamp)
             self.get_logger().info(f"appended to elevator ready queue [{timestamp}]")
 
-            if self.elevator_request:
-                mtrl_box_id, append_time = self.elevator_request.popleft()
-                self.get_logger().info(f"popped out from elevator request [{mtrl_box_id}] w/ {append_time}")
+            with self.elevator_mutex: 
+                if self.elevator_request:
+                    mtrl_box_id, append_time = self.elevator_request.popleft()
+                    self.get_logger().info(f"popped out from elevator request [{mtrl_box_id}] w/ {append_time}")
 
             self.get_logger().info(f"Elevator state changed 0 -> 1 at {timestamp}. Queue size: {len(self.elevator_ready)}")
 
@@ -402,7 +394,6 @@ class CoreSystem(Node):
 
         self.get_logger().debug(f"Received CameraTrigger message: camera_id={msg.camera_id}, material_box_id={msg.material_box_id}")
 
-
     def pkg_mac_status_cb(self, msg: PackagingMachineStatus) -> None:
         """
         Handle packaging machine status updates.
@@ -434,19 +425,23 @@ class CoreSystem(Node):
         """
         state_changed = False
         timestamp = self.get_clock().now()
+
         with self.vision_mutex:
             prev_vision_block_state = self.is_vision_block_released
             self.is_vision_block_released = msg.data
 
-            # Check for state transition (0 -> 1)
-            if msg.data and not prev_vision_block_state:
-                state_changed = True
+        # Check for state transition (0 -> 1)
+        if msg.data and not prev_vision_block_state:
+            state_changed = True
 
         if state_changed:
-            if len(self.vision_request) > 0:
-                self.send_vision_req(self.vision_request.popleft())
-                self.get_logger().info(f"sent the vision request")
+            with self.vision_mutex:
+                if len(self.vision_request) > 0:
+                    self.send_vision_req(self.vision_request.popleft())
+                    self.get_logger().info(f"sent the vision request")
+
             self.get_logger().info(f"Vision block state changed 0 -> 1 at {timestamp}. Queue size: {len(self.vision_request)}")
+            
         elif msg.data != prev_vision_block_state:
             self.get_logger().debug(f"Vision block state changed 1 -> 0. Queue size: {len(self.vision_request)}")
 
@@ -541,14 +536,16 @@ class CoreSystem(Node):
     # Timers callback
     def start_order_cb(self) -> None:
         with self.mutex:
+            if not self.recv_order or not self.is_plc_connected or self.is_releasing_mtrl_box:
+                return
             if self.elevator_request:
                 self.get_logger().debug("The material box retrieval have higher priority")
-                return
-            if not self.recv_order or not self.is_plc_connected or self.is_releasing_mtrl_box:
                 return
             if self.num_of_mtrl_box_in_container == 0:
                 self.get_logger().error(f"The material box is zero in container: {self.num_of_mtrl_box_in_container}")
                 return
+            
+        with self.occupy_mutex:
             if conveyor_seg := self.conveyor.get_conveyor(1): # first conveyor
                 if not conveyor_seg.available():
                     self.get_logger().error("The first conveyor is unavailable")
@@ -556,10 +553,12 @@ class CoreSystem(Node):
                     
         self.get_logger().info("The received queue stored a order")
 
+        with self.occupy_mutex:
+            conveyor_seg.occupy(-1) # FIXME: do not know the material box id
+        self.get_logger().error(f">>>>> Conveyor 1 Occupied")
+
         success = self._execute_movement(Const.TRANSFER_MTRL_BOX_ADDR, Const.MTRL_BOX_RELEASE_PLC_VALUES)
         if success:
-            with self.occupy_mutex:
-                conveyor_seg.occupy(-1) # FIXME: do not know the material box id
             with self.mutex:
                 highest_priority_order = max(self.recv_order, key=lambda _order: _order.priority)
                 self.proc_order[highest_priority_order.order_id] = deepcopy(highest_priority_order)
@@ -571,12 +570,17 @@ class CoreSystem(Node):
             self.get_logger().info(">>> Removed a order from received queue")
         else:
             self.get_logger().error("Failed to call the PLC to release a material box")
+            with self.occupy_mutex:
+                if conveyor_seg.is_occupied:
+                    conveyor_seg.clear()
+            self.get_logger().info(f"Clear conveyor id: {conveyor_seg.id}")
     
     def order_status_cb(self) -> None:
         """
         update and publish material box status messages.
         """
         curr_time = self.get_clock().now().to_msg()
+
         try:
             acquired = self.mutex.acquire(timeout=self.MUTEX_TIMEOUT)
             if not acquired:
@@ -605,13 +609,6 @@ class CoreSystem(Node):
         else:
             self.get_logger().error(f"Error in Sending a release blocking request")
         
-    def init_vision_cb(self) -> None:
-        success = self.send_init_vision()
-        if success:
-            self.get_logger().info(f"Initiated the vision inspection system successfully")
-        else:
-            self.get_logger().error(f"Initiate the vision inspection system failure or timeout")
-
     def jack_up_cb(self) -> None:
         """
         Process the jack-up queue and make movement decisions for material boxes.
@@ -846,12 +843,11 @@ class CoreSystem(Node):
                 return
             
             if conveyor and target_station and target_station.available():
+                target_station.occupy(mtrl_box_id)
+                self.get_logger().error(f">>>>> Station Occupied: {target_station.id} by material box: {mtrl_box_id}")
+
                 success = self._execute_movement(Const.GO_OPPOSITE_ADDR + source_station_id, Const.MOVE_OPPOSITE_VALUE)
                 if success:
-                    target_station.occupy(mtrl_box_id)
-
-                    self.get_logger().error(f">>>>> Station Occupied: {target_station.id} by material box: {mtrl_box_id}")
-
                     tmp = (jack_up_pt, order_id, source_station_id, mtrl_box_id)
                     to_remove.append(tmp)
                     self.get_logger().error(f"appeded to to_remove: {tmp}")
@@ -1531,7 +1527,8 @@ class CoreSystem(Node):
             self.get_logger().info("The conveyor segment is unavailable. Try to move out in the next callback")
             return False
         
-        conveyor_seg.occupy(mtrl_box_id)
+        with self.occupy_mutex:
+            conveyor_seg.occupy(mtrl_box_id)
         self.get_logger().error(f">>>>> Conveyor Occupied: {conveyor_seg.id} by material box: {mtrl_box_id}")
 
         success = self._execute_movement(Const.MOVEMENT_ADDR + station_id, [Const.EXIT_STATION])
@@ -1793,8 +1790,10 @@ class CoreSystem(Node):
             self.get_logger().warning(f"Go straight for camera {camera_id}")
 
             if next_conveyor and next_conveyor.available():
+                
                 if camera_id != 8:
-                    next_conveyor.occupy(material_box_id)
+                    with self.occupy_mutex:
+                        next_conveyor.occupy(material_box_id)
                     self.get_logger().error(f">>>>> Conveyor Occupied: {next_conveyor.id} by material box: {material_box_id}")
 
                 success = self._execute_movement(register_addr, Const.STRAIGHT_VALUE)
@@ -1988,34 +1987,8 @@ class CoreSystem(Node):
                     self.elevator_request.append((material_box_id, self.get_clock().now()))
                     self.get_logger().info(f"appended to elevator request [{material_box_id}]")
 
-        con_mtrl_box_success = self.send_con_mtrl_box(material_box_id)
-
         return is_completed
     
-    def send_init_vision(self)-> Optional[bool]:
-        MAX_RETIES = 3
-        reties = 0
-        while not self.init_vision_cli.wait_for_service(timeout_sec=0.05):
-            if not rclpy.ok() or reties >= MAX_RETIES:
-                return None
-            reties += 1
-            self.get_logger().info("init_visual_camera Service not available, waiting again...")
-        
-        req = Trigger.Request()
-
-        try:
-            future = self.init_vision_cli.call_async(req)
-            future.add_done_callback(self.init_vision_done_cb)
-
-            self.get_logger().info("init_vision_cli is called, waiting for future done")
-            return True
-        except AttributeError as e:
-            self.get_logger().error(f"Invalid service response: {str(e)}")
-            return False
-        except Exception as e:
-            self.get_logger().error(f"Service call failed: {str(e)}")
-            return False
-
     def send_rel_blocking(self)-> Optional[bool]:
         while not self.rel_blocking_cli.wait_for_service(timeout_sec=1.0):
             if not rclpy.ok():
@@ -2158,45 +2131,6 @@ class CoreSystem(Node):
             self.get_logger().error(f"Service call failed for order id {order_id}: {str(e)}")
             return False
        
-    def send_con_mtrl_box(self, mtrl_box_id: int) -> Optional[bool]:
-        """
-        Send a material box ID to the container service.
-        
-        Args:
-            mtrl_box_id: The material box ID to send
-            
-        Returns:
-            bool: True if successfully sent, False otherwise
-            
-        Raises:
-            TypeError: If mtrl_box_id is not an integer
-            ValueError: If mtrl_box_id is negative
-        """
-        if not isinstance(mtrl_box_id, int):
-            raise TypeError(f"Expected integer mtrl_box_id, got {type(mtrl_box_id).__name__}")
-        if mtrl_box_id < 0:
-            raise ValueError(f"Material box ID must be non-negative, got {mtrl_box_id}")
-        
-        req = UInt8Srv.Request()
-        req.data = mtrl_box_id
-
-        while not self.con_mtrl_box_cli.wait_for_service(timeout_sec=1.0):
-            if not rclpy.ok():
-                return None
-            self.get_logger().info("container_material_box Service not available, waiting again...")
-
-        try:
-            future = self.con_mtrl_box_cli.call_async(req)
-            future.add_done_callback(partial(self.con_mtrl_box_done_cb, mtrl_box_id))
-            
-            return True
-        except AttributeError as e:
-            self.get_logger().error(f"Invalid service response for ID {mtrl_box_id}: {str(e)}")
-            return False
-        except Exception as e:
-            self.get_logger().error(f"Service call failed for ID {mtrl_box_id}: {str(e)}")
-            return False
-
     def send_dispense_req(self, filtered_missing, station_id: int, cell_no: int, order_id: int) -> Optional[bool]:
         if not all(isinstance(x, (int)) for x in [station_id, cell_no, order_id]):
             self.get_logger().error("Invalid integer types provided")
@@ -2352,16 +2286,6 @@ class CoreSystem(Node):
             self.get_logger().error(f"Failed to send vision request: {str(e)}")
             return False
 
-    def init_vision_done_cb(self, future) -> None:
-        res = future.result()
-
-        if res and res.success:
-            self.init_vision_timer.cancel()
-            self.get_logger().info(f"Stopped the init vision timer")
-            self.get_logger().info(f"Sent the init visual camera successfully")
-        else:
-            self.get_logger().error("Failed to send init visual camera")
-
     def elevator_dequeue_done_cb(self, future) -> None:
         res = future.result()
 
@@ -2387,14 +2311,6 @@ class CoreSystem(Node):
         else:
             self.get_logger().error(f"Service call succeeded but reported failure for ID: {mtrl_box_id}")
        
-    def con_mtrl_box_done_cb(self, mtrl_box_id: int, future) -> None:
-        res = future.result()
-
-        if res and res.success:
-            self.get_logger().info(f"Successfully sent material box ID: {mtrl_box_id}")
-        else:
-            self.get_logger().error(f"Service call succeeded but reported failure for ID: {mtrl_box_id}")
-
     def pkg_req_done_cb(self, order_id: int, future) -> None:
         res = future.result()
 
@@ -2537,26 +2453,3 @@ class CoreSystem(Node):
             self.get_logger().info("Removed loop thread successfully")
 
         super().destroy_node()
-
-
-def main(args=None):
-    rclpy.init(args=args)
-    try:
-        executor = MultiThreadedExecutor()
-        core_sys = CoreSystem(executor)
-        executor.add_node(core_sys)
-        try:
-            executor.spin()
-        finally:
-            executor.shutdown()
-            core_sys.destroy_node()
-    except KeyboardInterrupt:
-        pass
-    except ExternalShutdownException:
-        sys.exit(1)
-    finally:
-        rclpy.try_shutdown()
-
-if __name__ == "__main__":
-    main()
-
