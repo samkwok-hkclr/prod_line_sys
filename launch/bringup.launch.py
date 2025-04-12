@@ -19,9 +19,9 @@ def generate_launch_description():
     
     core = Node(
         package=pkg_name,
-        executable="core_sys_node",
-        name="core_sys_node",
+        executable="bringup_node",
         output="screen",
+        emulate_tty=True
     )
 
     action_ser = Node(
@@ -29,6 +29,7 @@ def generate_launch_description():
         executable="new_order_action_ser_node",
         name="new_order_action_ser_node",
         output="screen",
+        emulate_tty=True
     )
 
     ld.add_action(core)
