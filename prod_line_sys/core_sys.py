@@ -388,10 +388,14 @@ class CoreSystem(Node):
         mtrl_box_id = msg.material_box_id
 
         if camera_id in (Const.CAMERA_ID_START, Const.CAMERA_ID_SPLIT_END):
-            with self.occupy_mutex:
-                if conveyor_msg := self.conveyor.get_conveyor(camera_id):
-                    conveyor_seg.occupy(mtrl_box_id)
-                    self.get_logger().error(f">>>>> Conveyor Occupied: {conveyor_seg.id} by material box: {mtrl_box_id}")
+            if conveyor_seg := self.conveyor.get_conveyor(camera_id):
+                with self.occupy_mutex:
+                    success = conveyor_seg.occupy(mtrl_box_id)
+                    if success:
+                        self.get_logger().warning(f">>>>> Conveyor Occupied: {conveyor_seg.id} by material box: {mtrl_box_id}")
+                    else:
+                        self.get_logger().error(f">>>>> Conveyor {camera_id} Occupy failed!")
+                        return
 
         curr_time = self.get_clock().now()
         
@@ -457,20 +461,17 @@ class CoreSystem(Node):
             prev_vision_block_state = self.is_vision_block_released
             self.is_vision_block_released = msg.data
 
-        # Check for state transition (0 -> 1)
-        if msg.data and not prev_vision_block_state:
-            state_changed = True
+            # Check for state transition (0 -> 1)
+            if msg.data and not prev_vision_block_state:
+                state_changed = True
+                self.get_logger().info(f"Vision block state changed 0 -> 1 at {timestamp}. Queue size: {len(self.vision_request)}")
 
-        if state_changed:
-            with self.vision_mutex:
-                if len(self.vision_request) > 0:
-                    self.send_vision_req(self.vision_request.popleft())
-                    self.get_logger().info(f"sent the vision request")
+            if state_changed and self.vision_request:
+                self.send_vision_req(self.vision_request.popleft())
+                self.get_logger().info(f"sent the vision request")
 
-            self.get_logger().info(f"Vision block state changed 0 -> 1 at {timestamp}. Queue size: {len(self.vision_request)}")
-            
-        elif msg.data != prev_vision_block_state:
-            self.get_logger().debug(f"Vision block state changed 1 -> 0. Queue size: {len(self.vision_request)}")
+            elif msg.data != prev_vision_block_state:
+                self.get_logger().debug(f"Vision block state changed 1 -> 0. Queue size: {len(self.vision_request)}")
 
     def con_mtrl_box_cb(self, msg: UInt8) -> None:
         if not (0 <= msg.data <= Const.MAX_MTRL_BOX_IN_CON):
@@ -547,15 +548,19 @@ class CoreSystem(Node):
                 return
             
         with self.occupy_mutex:
-            if conveyor_seg := self.conveyor.get_conveyor(1): # first conveyor
+            if conveyor_seg := self.conveyor.get_conveyor(Const.CAMERA_ID_START): # first conveyor segment
                 if not conveyor_seg.available():
                     self.get_logger().error("The first conveyor is unavailable")
                     return
-                    
-            self.get_logger().info("The received queue stored a order")
 
-            conveyor_seg.occupy(-1) # FIXME: do not know the material box id
-            self.get_logger().error(f">>>>> Conveyor 1 Occupied")
+            success = conveyor_seg.occupy(-1) # FIXME: do not know the material box id
+            if success:
+                self.get_logger().warning(f">>>>> Conveyor Occupied: {Const.CAMERA_ID_START}")
+            else:
+                self.get_logger().error(f">>>>> Conveyor {Const.CAMERA_ID_START} Occupy failed!")
+                return
+
+        self.get_logger().info("The received queue stored a order")
 
         success = self._execute_movement(PlcConst.TRANSFER_MTRL_BOX_ADDR, PlcConst.MTRL_BOX_RELEASE_PLC_VALUES)
         if success:
@@ -777,9 +782,13 @@ class CoreSystem(Node):
                 return
 
             self.get_logger().info(f"next_conveyor available!!!!!")
-            next_conveyor.occupy(mtrl_box_id)
-            self.get_logger().error(f">>>>> Conveyor Occupied: {next_conveyor.id} by material box: {mtrl_box_id}")
-
+            success = next_conveyor.occupy(mtrl_box_id)
+            if success:
+                self.get_logger().warning(f">>>>> Conveyor Occupied: {next_conveyor.id} by material box: {mtrl_box_id}")
+            else:
+                self.get_logger().error(f">>>>> Conveyor {next_conveyor.id} Occupy failed!")
+                return
+            
             success = self._execute_movement(PlcConst.GO_OPPOSITE_ADDR + source_station_id, PlcConst.EXIT_JACK_UP_VALUE)
             if success:
                 tmp = (jack_up_pt, order_id, source_station_id, mtrl_box_id)
@@ -801,8 +810,11 @@ class CoreSystem(Node):
                 return 
             
             self.get_logger().info(f"target_station available!!!!!")
-            target_station.occupy(mtrl_box_id)
-            self.get_logger().error(f">>>>> Station Occupied: {target_station.id} by material box: {mtrl_box_id}")
+            success = target_station.occupy(mtrl_box_id)
+            if success:
+                self.get_logger().warning(f">>>>> Station Occupied: {target_station.id} by material box: {mtrl_box_id}")
+            else:
+                self.get_logger().error(f">>>>> Station {target_station.id} Occupy failed!")
 
             success = self._execute_movement(PlcConst.GO_OPPOSITE_ADDR + source_station_id, PlcConst.MOVE_OPPOSITE_VALUE)
             if success:
@@ -1007,73 +1019,7 @@ class CoreSystem(Node):
             res.message = error_msg
 
         return res
-    
-    def movement_decision_v1(self, order_id: int, station_ids: List[int]) -> Optional[int]:
-        """
-        Determine the next station ID for an order based on requirements and availability.
-        
-        Args:
-            order_id: The order to process
-            station_ids: List of available dispenser station IDs
-            
-        Returns:
-            Optional[int]: Selected station ID if successful, None if no suitable station found
-            
-        Raises:
-            TypeError: If inputs are of incorrect type
-            ValueError: If order_id is negative or station_ids is empty
-        """
-        if not isinstance(order_id, int):
-            raise TypeError(f"Expected integer order_id, got {type(order_id).__name__}")
-        if not isinstance(station_ids, list) or not all(isinstance(x, int) for x in station_ids):
-            raise TypeError(f"Expected list of integers for station_ids, got {type(station_ids).__name__}")
-        if order_id < 0:
-            raise ValueError(f"Order ID must be non-negative, got {order_id}")
-        if not station_ids:
-            raise ValueError("Dispenser station ID list cannot be empty")
-        
-        try:
-            remainder = self.find_remainder(order_id)
 
-            if remainder is None or not bool(remainder):
-                self.get_logger().error(f"Empty remainder!")
-                return Const.GO_STRAIGHT
-
-            try:
-                acquired = self.mutex.acquire(timeout=self.MUTEX_TIMEOUT)
-                if not acquired:
-                    self.get_logger().error(f"Failed to acquire lock to movement decision v1")
-                    return Const.GO_STRAIGHT
-
-                for station_id in station_ids:
-                    station = self.conveyor.get_station(station_id)
-                    if station and station.available() and station_id in remainder:
-                        self.get_logger().info(f"Selected station {station_id} for order {order_id}")
-                        return station_id
-    
-            except TimeoutError:
-                self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
-                return Const.GO_STRAIGHT
-            except Exception as e:
-                self.get_logger().error(f"Error: {str(e)}")
-                return Const.GO_STRAIGHT
-            finally:
-                if self.mutex.locked():
-                    self.mutex.release()
-                
-            self.get_logger().info(f"No suitable station found for order {order_id} from {station_ids}")
-            return Const.GO_STRAIGHT
-
-        except AttributeError as e:
-            self.get_logger().error(f"Invalid data structure for order {order_id}: {str(e)}")
-            return Const.GO_STRAIGHT
-        except ValueError as e:
-            self.get_logger().error(f"Set operation error for order {order_id}: {str(e)}")
-            return Const.GO_STRAIGHT
-        except Exception as e:
-            self.get_logger().error(f"Unexpected error for order {order_id}: {str(e)}")
-            return Const.GO_STRAIGHT
-        
     def movement_decision_v2(self, order_id: int, station_ids: List[int]) -> Optional[int]:
         """
         Determine the next station ID for an order based on minimum station id requirements and availability.
@@ -1375,9 +1321,10 @@ class CoreSystem(Node):
             self.get_logger().info("Station 1 or 2: The material box is releasing. Try to move out in the next callback")
             return False
 
-        if self.jack_up_status.get(station_id):
-            self.get_logger().error(f"station {station_id}: Jack-up point is busy, wait for next callback")
-            return False
+        with self.jack_up_mutex:
+            if self.jack_up_status.get(station_id):
+                self.get_logger().error(f"station {station_id}: Jack-up point is busy, wait for next callback")
+                return False
             
         conveyor_seg = self.conveyor.get_conveyor_by_station(station_id)
         with self.occupy_mutex:
@@ -1385,9 +1332,13 @@ class CoreSystem(Node):
                 self.get_logger().info("The conveyor segment is unavailable. Try to move out in the next callback")
                 return False
     
-            conveyor_seg.occupy(mtrl_box_id)
-            self.get_logger().error(f">>>>> Conveyor Occupied: {conveyor_seg.id} by material box: {mtrl_box_id}")
-
+            success = conveyor_seg.occupy(mtrl_box_id)
+            if success:
+                self.get_logger().warning(f">>>>> Conveyor Occupied: {conveyor_seg.id} by material box: {mtrl_box_id}")
+            else:
+                self.get_logger().error(f">>>>> Conveyor {conveyor_seg.id} Occupy failed!")
+                return False
+            
             success = self._execute_movement(PlcConst.MOVEMENT_ADDR + station_id, [PlcConst.EXIT_STATION])
             if success:
                 self.get_logger().info("locked")
@@ -1614,9 +1565,13 @@ class CoreSystem(Node):
                     self.get_logger().warning(f"The next conveyor is unavailable for camera [{camera_id}]")
                     return False
 
-                station.occupy(material_box_id)
-                self.get_logger().error(f">>>>> Station Occupied: {station.id} by material box: {material_box_id}")
-
+                success = station.occupy(material_box_id)
+                if success:
+                    self.get_logger().warning(f">>>>> Station Occupied: {station.id} by material box: {material_box_id}")
+                else:
+                    self.get_logger().error(f">>>>> Station {station.id} Occupy failed!")
+                    return False
+                
                 success = self._execute_movement(register_addr, PlcConst.STATION_VALUE_MAP.get(decision))
                 if not success:
                     station.clear()
@@ -1635,9 +1590,13 @@ class CoreSystem(Node):
                     return False
 
                 if camera_id != 8:
-                    next_conveyor.occupy(material_box_id)
-                    self.get_logger().error(f">>>>> Conveyor Occupied: {next_conveyor.id} by material box: {material_box_id}")
-
+                    success = next_conveyor.occupy(material_box_id)
+                    if success:
+                        self.get_logger().warning(f">>>>> Conveyor Occupied: {next_conveyor.id} by material box: {material_box_id}")
+                    else:
+                        self.get_logger().error(f">>>>> Conveyor {next_conveyor.id} Occupy failed!")
+                        return False
+                    
                 success = self._execute_movement(register_addr, PlcConst.STRAIGHT_VALUE)
                 if not success:
                     next_conveyor.clear()
@@ -1913,10 +1872,10 @@ class CoreSystem(Node):
             _date = proc_order.start_date
             try:
                 dt = datetime.strptime(_date, PkgInfo.DATE_FORMAT)
-                self.get_logger().warning(f"dt: {dt}")
-                days_to_add = (proc_order.start_meal + i) // 4  # integer division
-                new_date = dt + timedelta(days=days_to_add)     # Add the days to the original datetime
-                self.get_logger().warning(f"new_date: {new_date}")
+                self.get_logger().debug(f"dt: {dt}")
+                days_to_add = (proc_order.start_meal + i) // 4 
+                new_date = dt + timedelta(days=days_to_add)
+                self.get_logger().debug(f"new_date: {new_date}")
                 self.get_logger().warning(f"new_date.strftime({PkgInfo.DATE_FORMAT}): {new_date.strftime(PkgInfo.DATE_FORMAT)}")
                 info.date = f"Date: {new_date.strftime(PkgInfo.DATE_FORMAT)}"
             except ValueError as e:
@@ -2156,8 +2115,6 @@ class CoreSystem(Node):
         res = future.result()
 
         if res and res.success:
-            self.get_logger().debug(f"Dispense drug in station {station_id} successfully")
-
             station = self.conveyor.get_station(station_id)
             station.set_completed(cell_no, True)
             station.set_dispense_req_done(cell_no, True)
@@ -2178,6 +2135,7 @@ class CoreSystem(Node):
                         self.get_logger().info(f"detail: >>> {status.material_box.slots[cell_no].dispensing_detail}")
             else:
                 self.get_logger().info(f"status is not found in dispense_done_cb by order id {order_id}")
+            
             self.get_logger().info(f"Dispense completed for station {station_id}, cell {cell_no}")
         else:
             self.get_logger().error(f"Service call succeeded but reported failure for dispenser station: {station_id}")
@@ -2277,3 +2235,71 @@ class CoreSystem(Node):
             self.get_logger().info("Removed loop thread successfully")
 
         super().destroy_node()
+
+    # deprecated functions
+    def movement_decision_v1(self, order_id: int, station_ids: List[int]) -> Optional[int]:
+        """
+        Determine the next station ID for an order based on requirements and availability.
+        
+        Args:
+            order_id: The order to process
+            station_ids: List of available dispenser station IDs
+            
+        Returns:
+            Optional[int]: Selected station ID if successful, None if no suitable station found
+            
+        Raises:
+            TypeError: If inputs are of incorrect type
+            ValueError: If order_id is negative or station_ids is empty
+        """
+        if not isinstance(order_id, int):
+            raise TypeError(f"Expected integer order_id, got {type(order_id).__name__}")
+        if not isinstance(station_ids, list) or not all(isinstance(x, int) for x in station_ids):
+            raise TypeError(f"Expected list of integers for station_ids, got {type(station_ids).__name__}")
+        if order_id < 0:
+            raise ValueError(f"Order ID must be non-negative, got {order_id}")
+        if not station_ids:
+            raise ValueError("Dispenser station ID list cannot be empty")
+        
+        try:
+            remainder = self.find_remainder(order_id)
+
+            if remainder is None or not bool(remainder):
+                self.get_logger().error(f"Empty remainder!")
+                return Const.GO_STRAIGHT
+
+            try:
+                acquired = self.mutex.acquire(timeout=self.MUTEX_TIMEOUT)
+                if not acquired:
+                    self.get_logger().error(f"Failed to acquire lock to movement decision v1")
+                    return Const.GO_STRAIGHT
+
+                for station_id in station_ids:
+                    station = self.conveyor.get_station(station_id)
+                    if station and station.available() and station_id in remainder:
+                        self.get_logger().info(f"Selected station {station_id} for order {order_id}")
+                        return station_id
+    
+            except TimeoutError:
+                self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
+                return Const.GO_STRAIGHT
+            except Exception as e:
+                self.get_logger().error(f"Error: {str(e)}")
+                return Const.GO_STRAIGHT
+            finally:
+                if self.mutex.locked():
+                    self.mutex.release()
+                
+            self.get_logger().info(f"No suitable station found for order {order_id} from {station_ids}")
+            return Const.GO_STRAIGHT
+
+        except AttributeError as e:
+            self.get_logger().error(f"Invalid data structure for order {order_id}: {str(e)}")
+            return Const.GO_STRAIGHT
+        except ValueError as e:
+            self.get_logger().error(f"Set operation error for order {order_id}: {str(e)}")
+            return Const.GO_STRAIGHT
+        except Exception as e:
+            self.get_logger().error(f"Unexpected error for order {order_id}: {str(e)}")
+            return Const.GO_STRAIGHT
+        

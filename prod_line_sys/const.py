@@ -27,7 +27,6 @@ class Const:
     GO_STRAIGHT: Final[int] = 0
     
     CELLS: Final[int] = 28
-    # EXIT_STATION: Final[int] = 29
     
     NUM_DISPENSER_STATIONS: Final[int] = 14
 

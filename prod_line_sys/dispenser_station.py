@@ -37,7 +37,7 @@ class DispenserStation:
             raise TypeError(f"Expected integer id, got {type(mtrl_box_id).__name__}")
         
         with self.mutex:
-            if _is_occupied:
+            if self._is_occupied:
                 return False
                 
             self._curr_mtrl_box = mtrl_box_id

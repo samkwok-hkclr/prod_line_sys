@@ -4,20 +4,20 @@ from typing import final, Final, Dict, List
 class PlcConst:
     EXIT_STATION: Final[int] = 29
 
-    MOVEMENT_ADDR: Final[int] = 5000
+    MOVEMENT_ADDR: Final[int]          = 5000
+    GO_OPPOSITE_ADDR: Final[int]       = 5150
     TRANSFER_MTRL_BOX_ADDR: Final[int] = 5200
-    GO_OPPOSITE_ADDR: Final[int] = 5150
-    RELEASE_CLEANING_ADDR: Final[int] = 5420
-    RELEASE_VISION_ADDR: Final[int] = 5421
+    RELEASE_CLEANING_ADDR: Final[int]  = 5420
+    RELEASE_VISION_ADDR: Final[int]    = 5421
 
     RELEASE_VALUE: Final[int] = [1]
 
-    EXIT_JACK_UP_VALUE: Final[List] = [1]
+    EXIT_JACK_UP_VALUE: Final[List]  = [1]
     MOVE_OPPOSITE_VALUE: Final[List] = [2]
 
     MTRL_BOX_RETRIEVAL_PLC_VALUES: Final[List] = [1]
-    MTRL_BOX_RELEASE_PLC_VALUES: Final[List] = [2]
-    MTRL_BOX_BYPASS_PLC_VALUES: Final[List] = [3]
+    MTRL_BOX_RELEASE_PLC_VALUES: Final[List]   = [2]
+    MTRL_BOX_BYPASS_PLC_VALUES: Final[List]    = [3]
 
     CAMERA_STATION_PLC_MAP: Final[Dict] = {
         1: ([1, 2],   5201),
@@ -64,6 +64,8 @@ class PlcConst:
     }
 
     SENSOR_LENGTH: Final[int] = 77
+    CLEANING_LOC_INDEX: Final[int] = 2
+    VISION_LOC_INDEX: Final[int] = 74
     CONTAINER_SENSOR: Final[Dict] = {
         1: range(0, 1)
     }
@@ -94,7 +96,6 @@ class PlcConst:
         8: range(65, 68),
         9: range(74, 77)
     }
-    
     JACK_UP_POINT: Final[Dict] = {
         1: 1,
         2: 1,
@@ -131,5 +132,3 @@ class PlcConst:
         7: 65,
         8: 74,
     }
-    CLEANING_LOC_INDEX: Final[int] = 2
-    VISION_LOC_INDEX: Final[int] = 74
