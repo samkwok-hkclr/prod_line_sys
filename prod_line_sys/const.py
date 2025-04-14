@@ -2,13 +2,18 @@ from typing import final, Final, Dict, List
 
 @final
 class Const:
+    DEBUG_FLAG = False
+    
     FAKE_DISPENSE: Final[bool] = False
+    FORCE_MOVE_OUT: Final[bool] = False
+
     MOVEMENT_VERSION: Final[int] = 2
 
     GRID_WIDTH: Final[int] = 7
     GRID_HEIGHT: Final[int] = 4
 
     CAMERA_ID_START: Final[int] = 1
+    CAMERA_ID_SPLIT_END: Final[int] = 8
     CAMERA_ID_END: Final[int] = 11
 
     MTRL_BOX_ID_START: Final[int] = 1

@@ -32,13 +32,17 @@ class DispenserStation:
             self._is_dispense_req_done = [False] * Const.CELLS
             self._is_verified = [False] * Const.CELLS
 
-    def occupy(self, mtrl_box_id: int):
+    def occupy(self, mtrl_box_id: int) -> bool:
         if not isinstance(mtrl_box_id, int):
             raise TypeError(f"Expected integer id, got {type(mtrl_box_id).__name__}")
         
         with self.mutex:
+            if _is_occupied:
+                return False
+                
             self._curr_mtrl_box = mtrl_box_id
             self._is_occupied = True 
+            return True
 
     def available(self) -> bool:
         if not self._is_occupied and self._is_free:
