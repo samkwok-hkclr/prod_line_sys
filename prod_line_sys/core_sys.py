@@ -387,14 +387,14 @@ class CoreSystem(Node):
         camera_id = msg.camera_id
         mtrl_box_id = msg.material_box_id
 
-        if camera_id in (Const.CAMERA_ID_START, Const.CAMERA_ID_SPLIT_END):
+        if camera_id in range(Const.CAMERA_ID_START, Const.CAMERA_ID_VISION):
             if conveyor_seg := self.conveyor.get_conveyor(camera_id):
                 with self.occupy_mutex:
-                    success = conveyor_seg.occupy(mtrl_box_id)
+                    success = conveyor_seg.force_occupy(mtrl_box_id)
                     if success:
                         self.get_logger().warning(f">>>>> Conveyor Occupied: {conveyor_seg.id} by material box: {mtrl_box_id}")
                     else:
-                        self.get_logger().error(f">>>>> Conveyor {camera_id} Occupy failed!")
+                        self.get_logger().error(f">>>>> Conveyor {camera_id} Occupy failed in qr_scan_cb!")
                         return
 
         curr_time = self.get_clock().now()
@@ -553,12 +553,12 @@ class CoreSystem(Node):
                     self.get_logger().error("The first conveyor is unavailable")
                     return
 
-            success = conveyor_seg.occupy(-1) # FIXME: do not know the material box id
-            if success:
-                self.get_logger().warning(f">>>>> Conveyor Occupied: {Const.CAMERA_ID_START}")
-            else:
-                self.get_logger().error(f">>>>> Conveyor {Const.CAMERA_ID_START} Occupy failed!")
-                return
+            # success = conveyor_seg.occupy(-1) # FIXME: do not know the material box id
+            # if success:
+            #     self.get_logger().warning(f">>>>> Conveyor Occupied: {Const.CAMERA_ID_START}")
+            # else:
+            #     self.get_logger().error(f">>>>> Conveyor {Const.CAMERA_ID_START} Occupy failed!")
+            #     return
 
         self.get_logger().info("The received queue stored a order")
 
@@ -856,7 +856,7 @@ class CoreSystem(Node):
                     is_completed = self.camera_1_to_8_action(order_id, mtrl_box_id, camera_id) 
                 case 2 | 3 | 4 | 5 | 6 | 7 | 8: # QR camera
                     if order_id is None:
-                        self.get_logger().info(f"The scan maybe incorrect cameras: {msg.camera_id}, box: {msg.mtrl_box_id} ")
+                        self.get_logger().info(f"The scan maybe incorrect cameras: {msg.camera_id}, box: {msg.material_box_id} ")
                         is_completed = True
                     else:
                         is_completed = self.camera_1_to_8_action(order_id, mtrl_box_id, camera_id) 
@@ -1589,12 +1589,12 @@ class CoreSystem(Node):
                     self.get_logger().warning(f"The next conveyor is unavailable for camera [{camera_id}]")
                     return False
 
-                if camera_id != 8:
+                if camera_id in range(Const.CAMERA_ID_START, Const.CAMERA_ID_VISION):
                     success = next_conveyor.occupy(material_box_id)
                     if success:
                         self.get_logger().warning(f">>>>> Conveyor Occupied: {next_conveyor.id} by material box: {material_box_id}")
                     else:
-                        self.get_logger().error(f">>>>> Conveyor {next_conveyor.id} Occupy failed!")
+                        self.get_logger().error(f">>>>> Conveyor {next_conveyor.id} Occupy failed in go straight!")
                         return False
                     
                 success = self._execute_movement(register_addr, PlcConst.STRAIGHT_VALUE)
@@ -1686,6 +1686,12 @@ class CoreSystem(Node):
                 self.get_logger().warning(f"Sent a income materail box to packaging machine manager successfully")
             else:
                 self.get_logger().error(f"Failed to send the income materail box to packaging machine manager")
+
+        conveyor = self.conveyor.get_conveyor(Const.CAMERA_ID_VISION)
+        with self.occupy_mutex:
+            if conveyor and conveyor.is_occupied:
+                conveyor.clear()
+                self.get_logger().error(f"Clear conveyor id: {Const.CAMERA_ID_VISION}")
 
         return is_completed
     

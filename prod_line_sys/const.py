@@ -14,6 +14,7 @@ class Const:
 
     CAMERA_ID_START: Final[int] = 1
     CAMERA_ID_SPLIT_END: Final[int] = 8
+    CAMERA_ID_VISION: Final[int] = 9
     CAMERA_ID_END: Final[int] = 11
 
     MTRL_BOX_ID_START: Final[int] = 1
