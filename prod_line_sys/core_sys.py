@@ -578,7 +578,7 @@ class CoreSystem(Node):
             with self.occupy_mutex:
                 if conveyor_seg.is_occupied:
                     conveyor_seg.clear()
-            self.get_logger().error(f"Clear conveyor id: {conveyor_seg.id}")
+                    self.get_logger().error(f"Clear conveyor id: {conveyor_seg.id}")
     
     def order_status_cb(self) -> None:
         """
@@ -925,7 +925,8 @@ class CoreSystem(Node):
                 with self.jack_up_mutex:
                     self.jack_up_opposite_queue.append((PlcConst.JACK_UP_POINT[station_id], order_id, station_id, mtrl_box_id))
                 self.get_logger().warning(f"Appended {(order_id, station_id, mtrl_box_id)} to jack-up queue")
-
+            else:
+                self.get_logger().warning(f"move_out_station failed")
         elif cmd_sliding_platform == 0 or \
              cmd_sliding_platform != curr_sliding_platform or \
              cmd_sliding_platform != target_cell + 1:
@@ -1089,11 +1090,10 @@ class CoreSystem(Node):
         
         available_stations = []
         
-        with self.occupy_mutex:
-            for station_id in station_ids:
-                station = self.conveyor.get_station(station_id)
-                if station and station.available():
-                    available_stations.append(station_id)
+        for station_id in station_ids:
+            station = self.conveyor.get_station(station_id)
+            if station and station.available():
+                available_stations.append(station_id)
 
         return available_stations
 
@@ -1317,9 +1317,10 @@ class CoreSystem(Node):
     def move_out_station(self, station: DispenserStation, station_id: int, mtrl_box_id: int) -> bool:
         self.get_logger().info(f"Station {station_id} has all cells completed")
 
-        if station_id in (1, 2) and self.is_releasing_mtrl_box:
-            self.get_logger().info("Station 1 or 2: The material box is releasing. Try to move out in the next callback")
-            return False
+        with self.mutex:
+            if station_id in (1, 2) and self.is_releasing_mtrl_box:
+                self.get_logger().info("Station 1 or 2: The material box is releasing. Try to move out in the next callback")
+                return False
 
         with self.jack_up_mutex:
             if self.jack_up_status.get(station_id):
@@ -1341,10 +1342,7 @@ class CoreSystem(Node):
             
             success = self._execute_movement(PlcConst.MOVEMENT_ADDR + station_id, [PlcConst.EXIT_STATION])
             if success:
-                self.get_logger().info("locked")
                 station.clear()
-                self.get_logger().info("locked done")
-
                 self.get_logger().error(f">>>>> Station Released: {station.id}")
                 return True
             else:
@@ -1541,11 +1539,12 @@ class CoreSystem(Node):
         is_completed = False
 
         station_ids, register_addr = PlcConst.CAMERA_STATION_PLC_MAP[camera_id]
-        available_stations = self.remove_unavailable_station(station_ids)
 
         decision = 0
 
         with self.occupy_mutex:
+            available_stations = self.remove_unavailable_station(station_ids)
+
             if available_stations:
                 match Const.MOVEMENT_VERSION:
                     case 1:
