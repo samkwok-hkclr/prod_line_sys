@@ -22,15 +22,18 @@ class DispenserStation:
         
         self.mutex = Lock()
 
-    def clear(self):
+    def clear(self) -> bool:
         with self.mutex:
             self._curr_mtrl_box = 0
             self._is_occupied = False
+
             self._is_cleared_up_conveyor = False
             self._is_completed = [False] * Const.CELLS
             self._is_dispense_req_sent = [False] * Const.CELLS
             self._is_dispense_req_done = [False] * Const.CELLS
             self._is_verified = [False] * Const.CELLS
+        
+        return True
 
     def occupy(self, mtrl_box_id: int) -> bool:
         if not isinstance(mtrl_box_id, int):
@@ -42,11 +45,14 @@ class DispenserStation:
                 
             self._curr_mtrl_box = mtrl_box_id
             self._is_occupied = True 
-            return True
+
+        return True
 
     def available(self) -> bool:
-        if not self._is_occupied and self._is_free:
-            return True
+        with self.mutex:
+            if not self._is_occupied and self._is_free:
+                return True
+            
         return False
 
     @property

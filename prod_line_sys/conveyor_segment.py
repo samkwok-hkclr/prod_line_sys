@@ -14,10 +14,13 @@ class ConveyorSegment:
 
         self.mutex = Lock()
 
-    def clear(self):
+    def clear(self) -> bool:
         with self.mutex:
             self._curr_mtrl_box = 0
             self._is_occupied = False
+
+        return True
+        
 
     def force_occupy(self, mtrl_box_id: int):
         if not isinstance(mtrl_box_id, int):
@@ -26,9 +29,10 @@ class ConveyorSegment:
         with self.mutex:
             self._curr_mtrl_box = mtrl_box_id
             self._is_occupied = True
-            return True
 
-    def occupy(self, mtrl_box_id: int):
+        return True
+
+    def occupy(self, mtrl_box_id: int) -> bool:
         if not isinstance(mtrl_box_id, int):
             raise TypeError(f"Expected integer id, got {type(mtrl_box_id).__name__}")
         
@@ -38,11 +42,14 @@ class ConveyorSegment:
 
             self._curr_mtrl_box = mtrl_box_id
             self._is_occupied = True
-            return True
+
+        return True
 
     def available(self) -> bool:
-        if not self._is_occupied and self._is_free:
-            return True
+        with self.mutex:
+            if not self._is_occupied and self._is_free:
+                return True
+            
         return False
 
     @property
