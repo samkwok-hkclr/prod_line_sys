@@ -3,7 +3,7 @@ import time
 import asyncio
 from asyncio import run_coroutine_threadsafe
 from collections import deque
-from threading import Thread, Lock
+from threading import Thread, Lock, RLock
 from typing import Dict, List, Set, Tuple, Optional, Final
 from array import array
 from copy import copy, deepcopy
@@ -91,12 +91,12 @@ class CoreSystem(Node):
         # self.exec.add_node(self.test_cli_node)
 
         # mutex, FIXME: very messy!!!
-        self.mutex = Lock()
-        self.occupy_mutex = Lock()
-        self.qr_scan_mutex = Lock()
-        self.elevator_mutex = Lock()
-        self.vision_mutex = Lock()
-        self.jack_up_mutex = Lock()
+        self.mutex = RLock()
+        self.occupy_mutex = RLock()
+        self.qr_scan_mutex = RLock()
+        self.elevator_mutex = RLock()
+        self.vision_mutex = RLock()
+        self.jack_up_mutex = RLock()
 
         # Graph of conveyor structure
         self.conveyor = None
@@ -109,13 +109,13 @@ class CoreSystem(Node):
         self.get_logger().info("Loop Thread are started")
 
         # sync delay, try to avoid to use it
-        self.waiting_result = self.create_rate(1.0, self.get_clock())
+        # self.waiting_result = self.create_rate(1.0, self.get_clock())
 
         # Status of PLC registers
-        self.is_plc_connected = False
-        self.is_releasing_mtrl_box = False
-        self.is_elevator_ready = False
-        self.is_vision_block_released = False
+        self.is_plc_connected: bool = False
+        self.is_releasing_mtrl_box: bool = False
+        self.is_elevator_ready: bool = False
+        self.is_vision_block_released: bool = False
 
         # Callback groups
         sub_cbg = MutuallyExclusiveCallbackGroup()
@@ -126,6 +126,7 @@ class CoreSystem(Node):
         station_srv_cli_cbgs = [MutuallyExclusiveCallbackGroup() for _ in range(Const.NUM_DISPENSER_STATIONS)]
 
         normal_timer_cbg = MutuallyExclusiveCallbackGroup()
+        order_timer_cbg = MutuallyExclusiveCallbackGroup()
         occupancy_timer_cbg = MutuallyExclusiveCallbackGroup()
         elevator_timer_cbg = MutuallyExclusiveCallbackGroup()
         qr_handle_timer_cbg = MutuallyExclusiveCallbackGroup()
@@ -180,7 +181,7 @@ class CoreSystem(Node):
 
         # Timers
         self.qr_handle_timer = self.create_timer(1.0, self.qr_handle_cb, callback_group=qr_handle_timer_cbg)
-        self.start_order_timer = self.create_timer(1.0, self.start_order_cb, callback_group=normal_timer_cbg)
+        self.start_order_timer = self.create_timer(1.0, self.start_order_cb, callback_group=order_timer_cbg)
         self.order_status_timer = self.create_timer(1.0, self.order_status_cb, callback_group=normal_timer_cbg)
         self.elevator_timer = self.create_timer(0.5, self.elevator_dequeue_cb, callback_group=elevator_timer_cbg)
         self.jack_up_timer = self.create_timer(1.0, self.jack_up_cb, callback_group=jack_up_timer_cbg)
@@ -250,15 +251,15 @@ class CoreSystem(Node):
         
         updated_stations = []
         
-        with self.mutex:
-            for station_id, platform_location in enumerate(msg.data, start=1):
-                station = self.conveyor.get_station(station_id)
-                if station is None:
-                    self.get_logger().warning(f"No station found for ID {station_id} <<<< 1")
-                    continue
-                
+        for station_id, platform_location in enumerate(msg.data, start=1):
+            station = self.conveyor.get_station(station_id)
+            if station is None:
+                self.get_logger().warning(f"No station found for ID {station_id} <<<< 1")
+                continue
+            with self.mutex:
                 station.curr_sliding_platform = platform_location
-                updated_stations.append((station_id, platform_location))
+
+            updated_stations.append((station_id, platform_location))
 
         if updated_stations:
             self.get_logger().debug(f"Updated {len(updated_stations)} sliding platforms location: {dict(updated_stations)}")
@@ -277,15 +278,16 @@ class CoreSystem(Node):
             return
         
         updated_stations = []
-        with self.mutex:
-            for station_id, state in enumerate(msg.data, start=1):
-                station = self.conveyor.get_station(station_id)
-                if station is None:
-                    self.get_logger().warning(f"No station found for ID {station_id} <<<< 2")
-                    continue
-                
+        
+        for station_id, state in enumerate(msg.data, start=1):
+            station = self.conveyor.get_station(station_id)
+            if station is None:
+                self.get_logger().warning(f"No station found for ID {station_id} <<<< 2")
+                continue
+            with self.mutex:
                 station.cmd_sliding_platform = state
-                updated_stations.append((station_id, state))
+
+            updated_stations.append((station_id, state))
 
         if updated_stations:
             self.get_logger().debug(f"Updated {len(updated_stations)} sliding platforms command: {dict(updated_stations)}")
@@ -305,18 +307,18 @@ class CoreSystem(Node):
         
         updated_stations = []
         
-        with self.mutex:
-            for station_id, platform_ready_state in enumerate(msg.data, start=1):
-                station = self.conveyor.get_station(station_id)
-                if station is None:
-                    self.get_logger().warning(f"No station found for ID {station_id} <<<< 3")
-                    continue
-                
+        for station_id, platform_ready_state in enumerate(msg.data, start=1):
+            station = self.conveyor.get_station(station_id)
+            if station is None:
+                self.get_logger().warning(f"No station found for ID {station_id} <<<< 3")
+                continue
+            with self.mutex:
                 station.is_platform_ready = platform_ready_state
-                updated_stations.append((station_id, platform_ready_state))
 
-                if platform_ready_state != 0:
-                    self.get_logger().debug(f"Station [{station_id}] platform is ready!")
+            updated_stations.append((station_id, platform_ready_state))
+
+            if platform_ready_state != 0:
+                self.get_logger().debug(f"Station [{station_id}] platform is ready!")
         
         if updated_stations:
             self.get_logger().debug(f"Updated {len(updated_stations)} sliding platforms ready state: {dict(updated_stations)}")
@@ -520,7 +522,14 @@ class CoreSystem(Node):
     # Timers callback
     def start_order_cb(self) -> None:
         with self.mutex:
-            if not self.recv_order or not self.is_plc_connected or self.is_releasing_mtrl_box:
+            if not self.recv_order:
+                self.get_logger().debug("No order received")
+                return
+            if not self.is_plc_connected:
+                self.get_logger().debug("PLC is disconnected")
+                return 
+            if self.is_releasing_mtrl_box:
+                self.get_logger().info("The container is releasing box")
                 return
             if self.elevator_request:
                 self.get_logger().debug("The material box retrieval have higher priority")
@@ -528,7 +537,7 @@ class CoreSystem(Node):
             if self.num_of_mtrl_box_in_container == 0:
                 self.get_logger().error(f"The material box is zero in container: {self.num_of_mtrl_box_in_container}")
                 return
-            
+
         with self.occupy_mutex:
             if conveyor_seg := self.conveyor.get_conveyor(Const.CAMERA_ID_START): # first conveyor segment
                 if not conveyor_seg.available():
@@ -714,17 +723,15 @@ class CoreSystem(Node):
     def release_vision_cb(self) -> None:
         self.get_logger().debug(f"Started to release the vision inspection")
 
-        self.mutex.acquire()
-        if self.release_vision:
-            self.mutex.release()
-
-            success = self._execute_movement(PlcConst.RELEASE_VISION_ADDR, PlcConst.RELEASE_VALUE)
-            if success:
-                with self.mutex:
-                    self.release_vision = False
-                self.get_logger().debug(f"release the vision inspection")
-            else:
-                self.get_logger().error(f"write_registers movement failed")
+        with self.mutex:
+            if self.release_vision:
+                success = self._execute_movement(PlcConst.RELEASE_VISION_ADDR, PlcConst.RELEASE_VALUE)
+                if success:
+                    with self.mutex:
+                        self.release_vision = False
+                    self.get_logger().debug(f"release the vision inspection")
+                else:
+                    self.get_logger().error(f"write_registers movement failed")
 
     def clear_conveyor_occupancy_cb(self) -> None:
         self.get_logger().debug(f"Started to clear conveyor occupancy")
@@ -773,7 +780,7 @@ class CoreSystem(Node):
 
         with self.occupy_mutex:
             self.get_logger().info(f"occupy_mutex locked!!!")
-            if target_station and target_station.available():
+            if target_station and not target_station.available():
                 self.get_logger().error(f"Station [{target_station.id}] is unavailable. [free: {target_station.is_free}, occupied: {target_station.is_occupied}]")
                 self.get_logger().error(f"It will try to leave in next callback.")
                 return 
@@ -855,15 +862,17 @@ class CoreSystem(Node):
         if station is None:
             self.get_logger().warning(f"No station found with ID: {station_id}")
             return
-        if not station.is_occupied:
-            self.get_logger().debug(f"Station {station_id} is not accupied")
-            return
-        if station.curr_mtrl_box == 0:
-            self.get_logger().warning(f"Station {station_id} has no material box")
-            return
-        if not station.is_platform_ready:
-            self.get_logger().debug(f"Station {station_id} sliding platform is not ready")
-            return
+        with self.occupy_mutex:
+            if not station.is_occupied:
+                self.get_logger().debug(f"Station {station_id} is not accupied")
+                return
+            if station.curr_mtrl_box == 0:
+                self.get_logger().warning(f"Station {station_id} has no material box")
+                return
+        with self.mutex:  
+            if not station.is_platform_ready:
+                self.get_logger().debug(f"Station {station_id} sliding platform is not ready")
+                return
 
         with self.mutex:
             mtrl_box_id = station.curr_mtrl_box
@@ -1372,16 +1381,32 @@ class CoreSystem(Node):
         if not isinstance(station_id, int) or station_id < 0:
             self.get_logger().error(f"Invalid station_id: {station_id}")
             return None, 0
+
+        def _map_index(index: int) -> int:
+            if index == 0:
+                return index
+            if index == PlcConst.EXIT_STATION:
+                return index
+            if not (1 <= index <= Const.CELLS):
+                raise Exception("map index out of range")
+            return (index // Const.GRID_WIDTH) + (index % Const.GRID_WIDTH) * Const.GRID_HEIGHT 
         
         try:
             if Const.FORCE_MOVE_OUT:
                 target_cell = PlcConst.EXIT_STATION
                 self.get_logger().warning(f"Debug: force to move out Station [{station_id}]")
             else:
-                target_cell = station.is_completed.index(False)
+                target_cell = PlcConst.EXIT_STATION
+                with self.mutex:
+                    for i in range(0, Const.CELLS):
+                        transfered_index = _map_index(i)
+                        if station.is_completed[transfered_index] == False:
+                            target_cell = transfered_index
+                            break
+                    # target_cell = station.is_completed.index(False)
         except ValueError:
             target_cell = PlcConst.EXIT_STATION
-            
+        
         filtered_missing = []
         
         try:
@@ -1395,7 +1420,7 @@ class CoreSystem(Node):
                 for drug in cell_order_mtrl_box.drugs:
                     locations = tuple((loc.dispenser_station, loc.dispenser_unit, drug.amount) for loc in drug.locations)
                     required.add(locations)
-                        
+
                 # Find current drugs
                 curr: Set[Tuple[int, int, int], ...] = set()
                 for drug in cell_curr_mtrl_box.dispensing_detail:
@@ -1669,6 +1694,11 @@ class CoreSystem(Node):
                     else:
                         self.get_logger().error(f"Failed to write to register for elevator")
                 else:
+                    first_conveyor = self.conveyor.get_conveyor(Const.CAMERA_ID_START)
+                    if first_conveyor and not first_conveyor.available():
+                        self.get_logger().warning(f"The bypass action is stopped because the first conveyor is unavailable.")
+                        return False
+
                     elevator_success = self._execute_movement(PlcConst.TRANSFER_MTRL_BOX_ADDR, PlcConst.MTRL_BOX_BYPASS_PLC_VALUES)
                     if elevator_success:
                         is_completed = True
