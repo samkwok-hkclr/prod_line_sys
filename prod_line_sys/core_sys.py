@@ -75,6 +75,7 @@ class CoreSystem(Node):
         self.jack_up_exit_status: Dict[int, bool] = dict() # jack_up_pt, status
 
         self.is_mtrl_box_storing: bool = False
+        self.is_mtrl_box_coming: bool = False
 
         self.cleaning_state: bool = False
         self.release_cleaning: bool = False
@@ -179,6 +180,7 @@ class CoreSystem(Node):
         self.get_logger().info("Service Clients are created")
 
         # Timers
+        self.once_timer = self.create_timer(2.0, self.once_timer_cb, callback_group=normal_timer_cbg)
         self.qr_handle_timer = self.create_timer(1.0, self.qr_handle_cb, callback_group=qr_handle_timer_cbg)
         self.start_order_timer = self.create_timer(1.0, self.start_order_cb, callback_group=order_timer_cbg)
         self.order_status_timer = self.create_timer(1.0, self.order_status_cb, callback_group=normal_timer_cbg)
@@ -209,6 +211,23 @@ class CoreSystem(Node):
         self.get_logger().info("Action clients are created")
 
         self.get_logger().info("Produation Line Core System Node is started")
+    
+    def once_timer_cb(self) -> None:
+        self.get_logger().debug(f"once_timer_cb")
+
+        block_success = self.send_income_mtrl_box(1)
+        if block_success:
+            self.get_logger().info(f"Sent a income materail box to packaging machine manager successfully")
+        else:
+            self.get_logger().error(f"Failed to send the income materail box to packaging machine manager")
+
+        success = self.send_rel_blocking()
+        if success:
+            self.get_logger().info(f"Sent a release blocking request successfully")
+        else:
+            self.get_logger().error(f"Error in Sending a release blocking request")
+        
+        self.once_timer.cancel()
 
     # Subscription callbacks
     def plc_conn_cb(self, msg: Bool) -> None:
@@ -595,11 +614,17 @@ class CoreSystem(Node):
                 self.get_logger().debug(f"elevator is not ready in elevator_dequeue_cb")
                 return
 
-        success = self.send_rel_blocking()
-        if success:
-            self.get_logger().info(f"Sent a release blocking request successfully in elevator_dequeue_cb")
-        else:
-            self.get_logger().error(f"Error in Sending a release blocking request")
+        with self.mutex:
+            flag = self.is_mtrl_box_coming
+
+        if flag:
+            success = self.send_rel_blocking()
+            if success:
+                with self.mutex:
+                    self.is_mtrl_box_coming = False
+                self.get_logger().info(f"Reset is_mtrl_box_coming in elevator_dequeue_cb")
+            else:
+                self.get_logger().error(f"Error in Sending a release blocking request")
         
     def jack_up_cb(self) -> None:
         """
@@ -1758,7 +1783,7 @@ class CoreSystem(Node):
 
         return is_completed
     
-    def send_rel_blocking(self)-> Optional[bool]:
+    def send_rel_blocking(self) -> Optional[bool]:
         while not self.rel_blocking_cli.wait_for_service(timeout_sec=1.0):
             if not rclpy.ok():
                 return None
@@ -1768,7 +1793,7 @@ class CoreSystem(Node):
 
         try:
             future = self.rel_blocking_cli.call_async(req)
-            future.add_done_callback(self.elevator_dequeue_done_cb)
+            future.add_done_callback(self.rel_blocking_done_cb)
 
             self.get_logger().info("rel_blocking_cli is called, waiting for future done")
             return True
@@ -2060,7 +2085,7 @@ class CoreSystem(Node):
             self.get_logger().error(f"Failed to send vision request: {str(e)}")
             return False
 
-    def elevator_dequeue_done_cb(self, future) -> None:
+    def rel_blocking_done_cb(self, future) -> None:
         res = future.result()
 
         if res and res.success:
@@ -2069,7 +2094,7 @@ class CoreSystem(Node):
                 if self.elevator_ready:
                     tmp = self.elevator_ready.popleft()
             if tmp is not None:
-                self.get_logger().info(f"Removed from elevator_queue successfully")
+                self.get_logger().info(f"Removed from elevator_ready successfully")
             else:
                 self.get_logger().info(f"elevator_ready popleft failed")
 
@@ -2088,6 +2113,10 @@ class CoreSystem(Node):
 
         if res and res.success:
             self.get_logger().info(f"Successfully sent income material box ID: {mtrl_box_id}")
+
+            with self.mutex:
+                self.is_mtrl_box_coming = True
+            self.get_logger().warning(f"Set is_mtrl_box_coming in income_mtrl_box done callback")
         else:
             self.get_logger().error(f"Service call succeeded but reported failure for ID: {mtrl_box_id}")
        
@@ -2105,6 +2134,10 @@ class CoreSystem(Node):
             order = self.proc_order.pop(order_id)
             if order:
                 self.get_logger().info(f"Removed the order in proc_order: {order_id}")
+
+            with self.mutex:
+                self.is_mtrl_box_coming = True
+            self.get_logger().warning(f"Set is_mtrl_box_coming to True in pkg_req done callback")
         else:         
             self.get_logger().error(f"Packaging service failed for order {order_id}")
 
@@ -2113,8 +2146,14 @@ class CoreSystem(Node):
 
         if res and res.success:
             station = self.conveyor.get_station(station_id)
-            station.set_completed(cell_no, True)
-            station.set_dispense_req_done(cell_no, True)
+            if not station:
+                self.get_logger().info(f"station: {station_id} not found in dispense done callback")
+                return
+
+            with self.mutex:
+                station.set_completed(cell_no, True)
+                station.set_dispense_req_done(cell_no, True)
+
             self.get_logger().info(f"Set station: {station_id}, cell: {cell_no} to True successfully")
             
             if status := self.mtrl_box_status.get(order_id):
@@ -2234,9 +2273,9 @@ class CoreSystem(Node):
         self.conveyor.append(8)
         self.conveyor.attach_station(8, "left", DispenserStation(14))
         self.conveyor.attach_station(8, "right", DispenserStation(13))
-        self.conveyor.append(9) # Vision
-        self.conveyor.append(10) # Packaging Machine 1
-        self.conveyor.append(11) # Packaging Machine 2
+        self.conveyor.append(Const.CAMERA_ID_VISION) # Vision
+        self.conveyor.append(Const.CAMERA_ID_PKG_MAC_1) # Packaging Machine 1
+        self.conveyor.append(Const.CAMERA_ID_PKG_MAC_2) # Packaging Machine 2
 
         self.get_logger().info(f"\n{self.conveyor}")
 
@@ -2277,54 +2316,55 @@ class CoreSystem(Node):
             TypeError: If inputs are of incorrect type
             ValueError: If order_id is negative or station_ids is empty
         """
-        if not isinstance(order_id, int):
-            raise TypeError(f"Expected integer order_id, got {type(order_id).__name__}")
-        if not isinstance(station_ids, list) or not all(isinstance(x, int) for x in station_ids):
-            raise TypeError(f"Expected list of integers for station_ids, got {type(station_ids).__name__}")
-        if order_id < 0:
-            raise ValueError(f"Order ID must be non-negative, got {order_id}")
-        if not station_ids:
-            raise ValueError("Dispenser station ID list cannot be empty")
+        return Const.GO_STRAIGHT
+        # if not isinstance(order_id, int):
+        #     raise TypeError(f"Expected integer order_id, got {type(order_id).__name__}")
+        # if not isinstance(station_ids, list) or not all(isinstance(x, int) for x in station_ids):
+        #     raise TypeError(f"Expected list of integers for station_ids, got {type(station_ids).__name__}")
+        # if order_id < 0:
+        #     raise ValueError(f"Order ID must be non-negative, got {order_id}")
+        # if not station_ids:
+        #     raise ValueError("Dispenser station ID list cannot be empty")
         
-        try:
-            remainder = self.find_remainder(order_id)
+        # try:
+        #     remainder = self.find_remainder(order_id)
 
-            if remainder is None or not bool(remainder):
-                self.get_logger().error(f"Empty remainder!")
-                return Const.GO_STRAIGHT
+        #     if remainder is None or not bool(remainder):
+        #         self.get_logger().error(f"Empty remainder!")
+        #         return Const.GO_STRAIGHT
 
-            try:
-                acquired = self.mutex.acquire(timeout=self.MUTEX_TIMEOUT)
-                if not acquired:
-                    self.get_logger().error(f"Failed to acquire lock to movement decision v1")
-                    return Const.GO_STRAIGHT
+        #     try:
+        #         acquired = self.mutex.acquire(timeout=self.MUTEX_TIMEOUT)
+        #         if not acquired:
+        #             self.get_logger().error(f"Failed to acquire lock to movement decision v1")
+        #             return Const.GO_STRAIGHT
 
-                for station_id in station_ids:
-                    station = self.conveyor.get_station(station_id)
-                    if station and station.available() and station_id in remainder:
-                        self.get_logger().info(f"Selected station {station_id} for order {order_id}")
-                        return station_id
+        #         for station_id in station_ids:
+        #             station = self.conveyor.get_station(station_id)
+        #             if station and station.available() and station_id in remainder:
+        #                 self.get_logger().info(f"Selected station {station_id} for order {order_id}")
+        #                 return station_id
     
-            except TimeoutError:
-                self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
-                return Const.GO_STRAIGHT
-            except Exception as e:
-                self.get_logger().error(f"Error: {str(e)}")
-                return Const.GO_STRAIGHT
-            finally:
-                if self.mutex.locked():
-                    self.mutex.release()
+        #     except TimeoutError:
+        #         self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
+        #         return Const.GO_STRAIGHT
+        #     except Exception as e:
+        #         self.get_logger().error(f"Error: {str(e)}")
+        #         return Const.GO_STRAIGHT
+        #     finally:
+        #         if self.mutex.locked():
+        #             self.mutex.release()
                 
-            self.get_logger().info(f"No suitable station found for order {order_id} from {station_ids}")
-            return Const.GO_STRAIGHT
+        #     self.get_logger().info(f"No suitable station found for order {order_id} from {station_ids}")
+        #     return Const.GO_STRAIGHT
 
-        except AttributeError as e:
-            self.get_logger().error(f"Invalid data structure for order {order_id}: {str(e)}")
-            return Const.GO_STRAIGHT
-        except ValueError as e:
-            self.get_logger().error(f"Set operation error for order {order_id}: {str(e)}")
-            return Const.GO_STRAIGHT
-        except Exception as e:
-            self.get_logger().error(f"Unexpected error for order {order_id}: {str(e)}")
-            return Const.GO_STRAIGHT
+        # except AttributeError as e:
+        #     self.get_logger().error(f"Invalid data structure for order {order_id}: {str(e)}")
+        #     return Const.GO_STRAIGHT
+        # except ValueError as e:
+        #     self.get_logger().error(f"Set operation error for order {order_id}: {str(e)}")
+        #     return Const.GO_STRAIGHT
+        # except Exception as e:
+        #     self.get_logger().error(f"Unexpected error for order {order_id}: {str(e)}")
+        #     return Const.GO_STRAIGHT
         
