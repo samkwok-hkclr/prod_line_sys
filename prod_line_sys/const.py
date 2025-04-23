@@ -15,6 +15,8 @@ class Const:
     CAMERA_ID_START: Final[int] = 1
     CAMERA_ID_SPLIT_END: Final[int] = 8
     CAMERA_ID_VISION: Final[int] = 9
+    CAMERA_ID_PKG_MAC_1: Final[int] = 10
+    CAMERA_ID_PKG_MAC_2: Final[int] = 11
     CAMERA_ID_END: Final[int] = 11
 
     MTRL_BOX_ID_START: Final[int] = 1
@@ -30,3 +32,5 @@ class Const:
     CELLS: Final[int] = 28
     
     NUM_DISPENSER_STATIONS: Final[int] = 14
+
+    MAX_HISTORY_AGE_SEC: Final[float] = 120.0

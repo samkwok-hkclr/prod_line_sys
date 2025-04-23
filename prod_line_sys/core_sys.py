@@ -54,7 +54,6 @@ class CoreSystem(Node):
         self.exec = executor
 
         self.MUTEX_TIMEOUT: Final[float] = 1.0
-        self.MAX_HISTORY_AGE_SEC: Final[float] = 120.0
 
         # Local memory storage
         self.recv_order = deque(maxlen=32)
@@ -256,6 +255,7 @@ class CoreSystem(Node):
             if station is None:
                 self.get_logger().warning(f"No station found for ID {station_id} <<<< 1")
                 continue
+
             with self.mutex:
                 station.curr_sliding_platform = platform_location
 
@@ -284,6 +284,7 @@ class CoreSystem(Node):
             if station is None:
                 self.get_logger().warning(f"No station found for ID {station_id} <<<< 2")
                 continue
+
             with self.mutex:
                 station.cmd_sliding_platform = state
 
@@ -312,6 +313,7 @@ class CoreSystem(Node):
             if station is None:
                 self.get_logger().warning(f"No station found for ID {station_id} <<<< 3")
                 continue
+
             with self.mutex:
                 station.is_platform_ready = platform_ready_state
 
@@ -389,7 +391,7 @@ class CoreSystem(Node):
 
             self.qr_scan_history = deque(
                 (scan, scan_time) for scan, scan_time in self.qr_scan_history
-                if (curr_time - scan_time).nanoseconds / 1e9 <= self.MAX_HISTORY_AGE_SEC
+                if (curr_time - scan_time).nanoseconds / 1e9 <= Const.MAX_HISTORY_AGE_SEC
             )
 
             len_after = len(self.qr_scan_history)
@@ -509,10 +511,18 @@ class CoreSystem(Node):
                     conveyor.is_free = status
 
         with self.jack_up_mutex:
-            for pt, idx in PlcConst.JACK_UP_POINT_INDEX.items():
-                self.jack_up_status[pt] = bool(sensor_data[idx])
-            for pt, idx in PlcConst.JACK_UP_EXIT_INDEX.items():
-                self.jack_up_exit_status[pt] = bool(sensor_data[idx])
+            self.jack_up_status = {
+                pt: bool(sensor_data[idx])
+                for pt, idx in PlcConst.JACK_UP_POINT_INDEX.items()
+            }
+            self.jack_up_exit_status = {
+                pt: bool(sensor_data[idx])
+                for pt, idx in PlcConst.JACK_UP_EXIT_INDEX.items()
+            }
+            # for pt, idx in PlcConst.JACK_UP_POINT_INDEX.items():
+            #     self.jack_up_status[pt] = bool(sensor_data[idx])
+            # for pt, idx in PlcConst.JACK_UP_EXIT_INDEX.items():
+            #     self.jack_up_exit_status[pt] = bool(sensor_data[idx])
 
         self.get_logger().debug(f"jack_up_status: {self.jack_up_status}")
         self.get_logger().debug(f"jack_up_exit_status: {self.jack_up_exit_status}")
@@ -674,10 +684,8 @@ class CoreSystem(Node):
         jack_up_exit_status_msg: UInt8MultiArray = UInt8MultiArray()
 
         with self.jack_up_mutex:
-            for state in self.jack_up_status.values():
-                jack_up_status_msg.data.append(state)
-            for state in self.jack_up_exit_status.values():
-                jack_up_exit_status_msg.data.append(state)
+            jack_up_status_msg.data = [state for state in self.jack_up_status.values()]
+            jack_up_exit_status_msg.data = [state for state in self.jack_up_exit_status.values()]
 
         curr_conveyor = self.conveyor.head
 
@@ -1653,6 +1661,17 @@ class CoreSystem(Node):
             if conveyor and conveyor.is_occupied:
                 conveyor.clear()
                 self.get_logger().error(f"Clear conveyor id: {Const.CAMERA_ID_VISION}")
+        
+        pkg_conveyor = self.conveyor.get_conveyor(Const.CAMERA_ID_PKG_MAC_1)
+        with self.occupy_mutex:
+            if pkg_conveyor and pkg_conveyor.available():
+                success = pkg_conveyor.occupy(material_box_id)
+                if success:
+                    self.get_logger().warning(f">>>>> Conveyor Occupied: {pkg_conveyor.id} by material box: {material_box_id}")
+                else:
+                    self.get_logger().error(f">>>>> Conveyor {pkg_conveyor.id} Occupy failed!")
+            else:
+                self.get_logger().error(f"The pkg 1 conveyor is unavailable. [free: {pkg_conveyor.is_free}, occupied: {pkg_conveyor.is_occupied}]")
 
         return is_completed
     
@@ -1716,6 +1735,23 @@ class CoreSystem(Node):
                 if not any(req[0] == material_box_id for req in self.elevator_request):
                     self.elevator_request.append((material_box_id, self.get_clock().now()))
                     self.get_logger().info(f"appended to elevator request [{material_box_id}]")
+
+        pkg_1_conveyor = self.conveyor.get_conveyor(Const.CAMERA_ID_PKG_MAC_1)
+        with self.occupy_mutex:
+            if pkg_1_conveyor and pkg_1_conveyor.is_occupied:
+                pkg_1_conveyor.clear()
+                self.get_logger().error(f"Clear conveyor id: {Const.CAMERA_ID_PKG_MAC_1}")
+        
+        pkg_2_conveyor = self.conveyor.get_conveyor(Const.CAMERA_ID_PKG_MAC_2)
+        with self.occupy_mutex:
+            if pkg_2_conveyor and pkg_2_conveyor.available():
+                success = pkg_2_conveyor.occupy(material_box_id)
+                if success:
+                    self.get_logger().warning(f">>>>> Conveyor Occupied: {pkg_2_conveyor.id} by material box: {material_box_id}")
+                else:
+                    self.get_logger().error(f">>>>> Conveyor {pkg_2_conveyor.id} Occupy failed!")
+            else:
+                self.get_logger().error(f"The pkg 1 conveyor is unavailable. [free: {pkg_2_conveyor.is_free}, occupied: {pkg_2_conveyor.is_occupied}]")
 
         return is_completed
     
@@ -2033,6 +2069,12 @@ class CoreSystem(Node):
                 self.get_logger().info(f"Removed from elevator_queue successfully")
             else:
                 self.get_logger().info(f"elevator_ready popleft failed")
+
+            pkg_2_conveyor = self.conveyor.get_conveyor(Const.CAMERA_ID_PKG_MAC_2)
+            with self.occupy_mutex:
+                if pkg_2_conveyor and pkg_2_conveyor.is_occupied:
+                    pkg_2_conveyor.clear()
+                    self.get_logger().error(f"Clear conveyor id: {Const.CAMERA_ID_PKG_MAC_2}")
 
             self.get_logger().info(f"Sent the release blocking successfully")
         else:
