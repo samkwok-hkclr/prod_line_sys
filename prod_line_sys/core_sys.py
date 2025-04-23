@@ -733,13 +733,16 @@ class CoreSystem(Node):
 
         with self.mutex:
             if self.release_vision:
-                success = self._execute_movement(PlcConst.RELEASE_VISION_ADDR, PlcConst.RELEASE_VALUE)
-                if success:
-                    with self.mutex:
-                        self.release_vision = False
-                    self.get_logger().debug(f"release the vision inspection")
-                else:
-                    self.get_logger().error(f"write_registers movement failed")
+                pkg_1_conveyor = self.conveyor.get_conveyor(Const.CAMERA_ID_PKG_MAC_1)
+                pkg_2_conveyor = self.conveyor.get_conveyor(Const.CAMERA_ID_PKG_MAC_2)
+                if pkg_1_conveyor and pkg_2_conveyor and pkg_1_conveyor.available() and pkg_2_conveyor.available():
+                    success = self._execute_movement(PlcConst.RELEASE_VISION_ADDR, PlcConst.RELEASE_VALUE)
+                    if success:
+                        with self.mutex:
+                            self.release_vision = False
+                        self.get_logger().debug(f"release the vision inspection")
+                    else:
+                        self.get_logger().error(f"write_registers movement failed")
 
     def clear_conveyor_occupancy_cb(self) -> None:
         self.get_logger().debug(f"Started to clear conveyor occupancy")
