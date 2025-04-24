@@ -213,21 +213,22 @@ class CoreSystem(Node):
         self.get_logger().info("Produation Line Core System Node is started")
     
     def once_timer_cb(self) -> None:
-        self.get_logger().debug(f"once_timer_cb")
+        self.get_logger().info(f"once_timer callback is started")
 
-        block_success = self.send_income_mtrl_box(1)
-        if block_success:
-            self.get_logger().info(f"Sent a income materail box to packaging machine manager successfully")
-        else:
-            self.get_logger().error(f"Failed to send the income materail box to packaging machine manager")
+        # block_success = self.send_income_mtrl_box(1)
+        # if block_success:
+        #     self.get_logger().info(f"Sent a income materail box to packaging machine manager successfully")
+        # else:
+        #     self.get_logger().error(f"Failed to send the income materail box to packaging machine manager")
 
-        success = self.send_rel_blocking()
-        if success:
-            self.get_logger().info(f"Sent a release blocking request successfully")
-        else:
-            self.get_logger().error(f"Error in Sending a release blocking request")
+        # success = self.send_rel_blocking()
+        # if success:
+        #     self.get_logger().info(f"Sent a release blocking request successfully")
+        # else:
+        #     self.get_logger().error(f"Error in Sending a release blocking request")
         
         self.once_timer.cancel()
+        self.get_logger().info(f"once_timer is cancelled")
 
     # Subscription callbacks
     def plc_conn_cb(self, msg: Bool) -> None:
@@ -423,7 +424,7 @@ class CoreSystem(Node):
             if not found:
                 self.qr_scan_history.append((msg, self.get_clock().now()))
                 self.qr_scan.append(msg)
-                self.get_logger().info(f"Camera {msg.camera_id} box [{msg.material_box_id}] is append to qr_scan")
+                self.get_logger().info(f"Camera {msg.camera_id} box [{msg.material_box_id}] is appended to qr_scan")
 
         diff = len_befoce - len_after
         if diff > 0:
@@ -926,7 +927,7 @@ class CoreSystem(Node):
             status.location = f"station_{station_id}"
         
         filtered_missing, target_cell = self.find_target_cell(station, station_id, status, order)
-        self.get_logger().warning(f"target_cell: {target_cell}")
+        self.get_logger().debug(f"target_cell: {target_cell}")
 
         if not station.is_cleared_up_conveyor:
             conveyor = self.conveyor.get_conveyor_by_station(station_id)
@@ -948,11 +949,11 @@ class CoreSystem(Node):
         elif cmd_sliding_platform == 0 or \
              cmd_sliding_platform != curr_sliding_platform or \
              cmd_sliding_platform != target_cell + 1:
-            self.get_logger().info(f"station: {station_id} is sending the movement command")
+            self.get_logger().debug(f"station: {station_id} is sending the movement command")
             if target_cell + 1 != PlcConst.EXIT_STATION:
                 success = self._execute_movement(PlcConst.MOVEMENT_ADDR + station_id, [target_cell + 1])
                 if success:
-                    self.get_logger().warning(f"station: {station_id} is moving to {target_cell + 1} cell")
+                    self.get_logger().debug(f"station: {station_id} is moving to {target_cell + 1} cell")
                 else:
                     self.get_logger().error(f"write_registers movement failed")
             else:
@@ -1379,7 +1380,8 @@ class CoreSystem(Node):
             success = self.send_dispense_req(filtered_missing, station_id, target_cell, order.order_id)
 
             if success:
-                station.set_dispense_req_sent(target_cell, True)
+                with self.mutex:
+                    station.set_dispense_req_sent(target_cell, True)
                 return True
             
             self.get_logger().error(f"Dispense failed for station {station_id}, cell {target_cell}")
@@ -1447,7 +1449,7 @@ class CoreSystem(Node):
         
         try:
             while target_cell < Const.CELLS:
-                self.get_logger().error(f"Checking target_cell: {target_cell}")
+                self.get_logger().debug(f"Checking target_cell: {target_cell}")
                 cell_curr_mtrl_box = status.material_box.slots[target_cell]
                 cell_order_mtrl_box = order.material_box.slots[target_cell]
 
@@ -1486,13 +1488,15 @@ class CoreSystem(Node):
                 self.get_logger().warning(f"Cell {target_cell}: required={required}, curr={curr}, missing at station {station_id}={filtered_missing}")
 
                 if filtered_missing:
-                    station.set_verified(target_cell, True)
-                    self.get_logger().error(f"target_cell: {target_cell} has missing drugs: {filtered_missing}")
+                    with self.mutex:
+                        station.set_verified(target_cell, True)
+                    self.get_logger().warning(f"target_cell: {target_cell} has missing drugs: {filtered_missing}")
                     break
                 else:
-                    station.set_completed(target_cell, True)
-                    self.get_logger().info(f"Set target_cell: {target_cell} to True")
-                    self.get_logger().error(f"target_cell: {target_cell} is complete")
+                    with self.mutex:
+                        station.set_completed(target_cell, True)
+                    self.get_logger().debug(f"Set target_cell: {target_cell} to True")
+                    self.get_logger().debug(f"target_cell: {target_cell} is complete")
                     target_cell += 1
             
             return filtered_missing, target_cell
@@ -1615,7 +1619,7 @@ class CoreSystem(Node):
         if status := self.mtrl_box_status.get(order_id):
             with self.mutex:
                 status.location = f"camera_{camera_id}"
-            self.get_logger().info(f"updated location to camera_{camera_id} w/ box [{material_box_id}]")
+            self.get_logger().info(f"updated location to camera_{camera_id} w/ material box [{material_box_id}]")
 
         remainder = set()
         match Const.MOVEMENT_VERSION:
@@ -1664,7 +1668,7 @@ class CoreSystem(Node):
             # update location
             if status:
                 status.location = f"camera_{camera_id}"
-                self.get_logger().info(f"updated location to camera_{camera_id} w/ box [{material_box_id}]")
+                self.get_logger().info(f"updated location to camera_{camera_id} w/ material box [{material_box_id}]")
             if status and status.status == MaterialBoxStatus.STATUS_AWAITING_PACKAGING:
                 ready_to_pkg = True
 
@@ -1793,7 +1797,7 @@ class CoreSystem(Node):
 
         try:
             future = self.rel_blocking_cli.call_async(req)
-            future.add_done_callback(self.rel_blocking_done_cb)
+            future.add_done_callback(partial(self.rel_blocking_done_cb))
 
             self.get_logger().info("rel_blocking_cli is called, waiting for future done")
             return True
@@ -2104,7 +2108,7 @@ class CoreSystem(Node):
                     pkg_2_conveyor.clear()
                     self.get_logger().error(f"Clear conveyor id: {Const.CAMERA_ID_PKG_MAC_2}")
 
-            self.get_logger().info(f"Sent the release blocking successfully")
+            self.get_logger().info(f"Released the block successfully")
         else:
             self.get_logger().error("Failed to send rel_blocking")
 
@@ -2137,7 +2141,7 @@ class CoreSystem(Node):
 
             with self.mutex:
                 self.is_mtrl_box_coming = True
-            self.get_logger().warning(f"Set is_mtrl_box_coming to True in pkg_req done callback")
+            self.get_logger().warning(f"Set is_mtrl_box_coming in pkg_req done callback")
         else:         
             self.get_logger().error(f"Packaging service failed for order {order_id}")
 
@@ -2277,7 +2281,7 @@ class CoreSystem(Node):
         self.conveyor.append(Const.CAMERA_ID_PKG_MAC_1) # Packaging Machine 1
         self.conveyor.append(Const.CAMERA_ID_PKG_MAC_2) # Packaging Machine 2
 
-        self.get_logger().info(f"\n{self.conveyor}")
+        self.get_logger().debug(f"\n{self.conveyor}")
 
     def _get_dis_station_cli(self, station_id: int) -> Optional[rclpy.client.Client]:
         """Safely get a dispenser station client by ID."""

@@ -33,4 +33,4 @@ class Const:
     
     NUM_DISPENSER_STATIONS: Final[int] = 14
 
-    MAX_HISTORY_AGE_SEC: Final[float] = 120.0
+    MAX_HISTORY_AGE_SEC: Final[float] = 60.0
