@@ -180,7 +180,7 @@ class CoreSystem(Node):
         self.get_logger().info("Service Clients are created")
 
         # Timers
-        self.once_timer = self.create_timer(2.0, self.once_timer_cb, callback_group=normal_timer_cbg)
+        self.once_timer = self.create_timer(3.0, self.once_timer_cb, callback_group=normal_timer_cbg)
         self.qr_handle_timer = self.create_timer(1.0, self.qr_handle_cb, callback_group=qr_handle_timer_cbg)
         self.start_order_timer = self.create_timer(1.0, self.start_order_cb, callback_group=order_timer_cbg)
         self.order_status_timer = self.create_timer(1.0, self.order_status_cb, callback_group=normal_timer_cbg)
@@ -189,7 +189,7 @@ class CoreSystem(Node):
         self.occupancy_status_timer = self.create_timer(1.0, self.occupancy_status_cb, callback_group=occupancy_timer_cbg)
         self.release_cleaning_timer = self.create_timer(1.0, self.release_cleaning_cb, callback_group=normal_timer_cbg)
         self.release_vision_timer = self.create_timer(1.0, self.release_vision_cb, callback_group=normal_timer_cbg)
-        self.clear_conveyor_occupancy_timer = self.create_timer(0.1, self.clear_conveyor_occupancy_cb, callback_group=clear_timer_cbg)
+        self.clear_conveyor_occupancy_timer = self.create_timer(0.125, self.clear_conveyor_occupancy_cb, callback_group=clear_timer_cbg)
         self.dis_station_timers: Dict[int, rclpy.Timer.Timer] = dict()
         for i in range(1, Const.NUM_DISPENSER_STATIONS + 1):
             cbg_index = int(i - 1)
@@ -1652,6 +1652,9 @@ class CoreSystem(Node):
                     elevator_success = self._execute_movement(PlcConst.TRANSFER_MTRL_BOX_ADDR, PlcConst.MTRL_BOX_RETRIEVAL_PLC_VALUES)
                     if elevator_success:
                         if popped_status := self.mtrl_box_status.pop(order_id):
+                            popped_status.status = MaterialBoxStatus.STATUS_IN_STORAGE
+                            self.mtrl_box_status_pub.publish(popped_status)
+                            self.get_logger().warning(f"Published the last status")
                             is_completed = True
                         self.get_logger().warning(f"Sent elevator request (retrieval) successfully")
                     else:
