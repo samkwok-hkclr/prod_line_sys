@@ -66,7 +66,7 @@ class CoreSystem(Node):
         self.elevator_ready = deque(maxlen=4) # append to this queue if elevator state from 0 -> 1, 
         self.elevator_request = deque(maxlen=4) # append a request if needed
 
-        self.vision_request = deque(maxlen=16)
+        self.vision_request = deque(maxlen=8)
 
         self.jack_up_queue = deque(maxlen=16)
         self.jack_up_opposite_queue = deque(maxlen=16)
@@ -184,7 +184,7 @@ class CoreSystem(Node):
         self.qr_handle_timer = self.create_timer(1.0, self.qr_handle_cb, callback_group=qr_handle_timer_cbg)
         self.start_order_timer = self.create_timer(1.0, self.start_order_cb, callback_group=order_timer_cbg)
         self.order_status_timer = self.create_timer(1.0, self.order_status_cb, callback_group=normal_timer_cbg)
-        self.elevator_timer = self.create_timer(0.5, self.elevator_dequeue_cb, callback_group=elevator_timer_cbg)
+        self.elevator_dequeue_timer = self.create_timer(1.0, self.elevator_dequeue_cb, callback_group=elevator_timer_cbg)
         self.jack_up_timer = self.create_timer(1.0, self.jack_up_cb, callback_group=jack_up_timer_cbg)
         self.occupancy_status_timer = self.create_timer(1.0, self.occupancy_status_cb, callback_group=occupancy_timer_cbg)
         self.release_cleaning_timer = self.create_timer(1.0, self.release_cleaning_cb, callback_group=normal_timer_cbg)
@@ -254,8 +254,6 @@ class CoreSystem(Node):
         
         if new_state != prev_state:
             self.get_logger().warning(f"Release state changed: {prev_state} -> {new_state}")
-            
-        self.get_logger().debug(f"Material box release state: {new_state}")
 
     def sliding_pfm_curr_cb(self, msg: UInt8MultiArray) -> None:
         """
@@ -373,15 +371,15 @@ class CoreSystem(Node):
                     mtrl_box_id, append_time = self.elevator_request.popleft()
                     self.get_logger().info(f"popped out from elevator request [{mtrl_box_id}] w/ {append_time}")
 
-            self.get_logger().info(f"Elevator state changed 0 -> 1 at {timestamp}. Queue size: {len(self.elevator_ready)}")
+            self.get_logger().info(f"Elevator state changed 0 -> 1 at {timestamp}")
         
-        elif msg.data != prev_elevator_ready: # state transition (1 -> 0)
+        elif not msg.data and prev_elevator_ready: # state transition (1 -> 0)
             with self.mutex:
                 if self.is_mtrl_box_storing:
                     self.is_mtrl_box_storing = False
                     self.get_logger().info(f"Reset is_mtrl_box_storing")
                     
-            self.get_logger().info(f"Elevator state changed 1 -> 0. Queue size: {len(self.elevator_ready)}")
+            self.get_logger().info(f"Elevator state changed 1 -> 0 at {timestamp}")
 
     def qr_scan_cb(self, msg: CameraTrigger) -> None:
         if not (Const.CAMERA_ID_START <= msg.camera_id <= Const.CAMERA_ID_END):
@@ -459,24 +457,23 @@ class CoreSystem(Node):
         Args:
             msg: Bool message containing vision block status
         """
-        state_changed = False
         timestamp = self.get_clock().now()
 
         with self.vision_mutex:
             prev_vision_block_state = self.is_vision_block_released
             self.is_vision_block_released = msg.data
 
-            # Check for state transition (0 -> 1)
-            if msg.data and not prev_vision_block_state:
-                state_changed = True
+            if msg.data and not prev_vision_block_state: # Check for state transition (0 -> 1)
+                if self.vision_request:
+                    success = self.send_vision_req(self.vision_request.popleft())
+                    if success:
+                        self.get_logger().info(f"Sent the vision request successfully")
+                    else:
+                        self.get_logger().info(f"Failed to send the vision request")
+
                 self.get_logger().info(f"Vision block state changed 0 -> 1 at {timestamp}. Queue size: {len(self.vision_request)}")
 
-            if state_changed:
-                if self.vision_request:
-                    self.send_vision_req(self.vision_request.popleft())
-                    self.get_logger().info(f"sent the vision request")
-
-            elif msg.data != prev_vision_block_state:
+            elif not msg.data and prev_vision_block_state: # Check for state transition (1 -> 0)
                 self.get_logger().debug(f"Vision block state changed 1 -> 0. Queue size: {len(self.vision_request)}")
 
     def con_mtrl_box_cb(self, msg: UInt8) -> None:
@@ -486,7 +483,7 @@ class CoreSystem(Node):
 
         with self.mutex:
             self.num_of_mtrl_box_in_container = msg.data
-            self.get_logger().debug(f"number of material box in container: {self.num_of_mtrl_box_in_container}")
+        self.get_logger().debug(f"number of material box in container: {msg.data}")
 
     def loc_sensor_cb(self, msg: UInt8MultiArray) -> None:
         if len(msg.data) != PlcConst.SENSOR_LENGTH:
@@ -503,6 +500,16 @@ class CoreSystem(Node):
             conveyor_id: all(sensor_data[i] == 0 for i in indices)
             for conveyor_id, indices in PlcConst.CONVEYOR_SENSOR.items()
         }
+
+        with self.occupy_mutex:
+            for station_id, status in station_status.items():
+                if station := self.conveyor.get_station(station_id):
+                    station.is_free = status
+
+            for conveyor_id, status in conveyor_status.items():
+                if conveyor := self.conveyor.get_conveyor(conveyor_id):
+                    conveyor.is_free = status
+
         self.get_logger().debug(f"station_status: {station_status}")
         self.get_logger().debug(f"conveyor_status: {conveyor_status}")
         
@@ -521,15 +528,6 @@ class CoreSystem(Node):
                 self.release_vision = True
                 self.get_logger().info(f"A material box is passing throught vision inspection")
 
-        with self.occupy_mutex:
-            for station_id, status in station_status.items():
-                if station := self.conveyor.get_station(station_id):
-                    station.is_free = status
-
-            for conveyor_id, status in conveyor_status.items():
-                if conveyor := self.conveyor.get_conveyor(conveyor_id):
-                    conveyor.is_free = status
-
         with self.jack_up_mutex:
             self.jack_up_status = {
                 pt: bool(sensor_data[idx])
@@ -539,15 +537,9 @@ class CoreSystem(Node):
                 pt: bool(sensor_data[idx])
                 for pt, idx in PlcConst.JACK_UP_EXIT_INDEX.items()
             }
-            # for pt, idx in PlcConst.JACK_UP_POINT_INDEX.items():
-            #     self.jack_up_status[pt] = bool(sensor_data[idx])
-            # for pt, idx in PlcConst.JACK_UP_EXIT_INDEX.items():
-            #     self.jack_up_exit_status[pt] = bool(sensor_data[idx])
 
         self.get_logger().debug(f"jack_up_status: {self.jack_up_status}")
         self.get_logger().debug(f"jack_up_exit_status: {self.jack_up_exit_status}")
-
-        self.get_logger().debug(f"Sensor data matached")
 
     # Timers callback
     def start_order_cb(self) -> None:
@@ -561,11 +553,13 @@ class CoreSystem(Node):
             if self.is_releasing_mtrl_box:
                 self.get_logger().info("The container is releasing box")
                 return
-            if self.elevator_request:
-                self.get_logger().debug("The material box retrieval have higher priority")
-                return
             if self.num_of_mtrl_box_in_container == 0:
                 self.get_logger().error(f"The material box is zero in container: {self.num_of_mtrl_box_in_container}")
+                return
+            
+        with self.elevator_mutex:
+            if self.elevator_request:
+                self.get_logger().warning("Wait for the material box retrieval action complete")
                 return
 
         with self.occupy_mutex:
@@ -596,23 +590,26 @@ class CoreSystem(Node):
     
     def order_status_cb(self) -> None:
         """
-        update and publish material box status messages.
+        Publish material box status messages.
         """
         curr_time = self.get_clock().now().to_msg()
 
         with self.mutex:
-            for order_id, status in self.mtrl_box_status.items():
+            for status in self.mtrl_box_status.values():
                 status.header.stamp = curr_time
                 self.mtrl_box_status_pub.publish(status)
 
     def elevator_dequeue_cb(self) -> None:
-        with self.mutex:
-            if self.is_releasing_mtrl_box:
-                self.get_logger().debug(f"container is releasing material box in elevator_dequeue_cb")
-                return
+        # with self.mutex:
+        #     if self.is_releasing_mtrl_box:
+        #         self.get_logger().debug(f"container is releasing material box in elevator_dequeue_cb")
+        #         return
         with self.elevator_mutex:
+            if not self.is_elevator_ready:
+                self.get_logger().debug(f"elevator is not ready")
+                return
             if not self.elevator_ready:
-                self.get_logger().debug(f"elevator is not ready in elevator_dequeue_cb")
+                self.get_logger().debug(f"elevator ready queue is empty")
                 return
 
         with self.mutex:
@@ -623,7 +620,7 @@ class CoreSystem(Node):
             if success:
                 with self.mutex:
                     self.is_mtrl_box_coming = False
-                self.get_logger().info(f"Reset is_mtrl_box_coming in elevator_dequeue_cb")
+                self.get_logger().info(f"Reset is_mtrl_box_coming")
             else:
                 self.get_logger().error(f"Error in Sending a release blocking request")
         
@@ -964,7 +961,11 @@ class CoreSystem(Node):
             
         elif filtered_missing:
             self.get_logger().debug(f"try to dispense")
-            success = self.dispense_action(station, station_id, filtered_missing, order, target_cell)
+            # success = self.dispense_action(station, station_id, filtered_missing, order, target_cell)
+            success = self.send_dispense_req(filtered_missing, station_id, target_cell, order.order_id)
+            if success:
+                with self.mutex:
+                    station.set_dispense_req_sent(target_cell, True)
 
         self.get_logger().debug(f"The station {[station_id]} decision are made!!")
 
@@ -1206,38 +1207,6 @@ class CoreSystem(Node):
 
         return req_to_go
 
-    def find_remainder(self, order_id: int) -> Optional[set]:
-        try:
-            acquired = self.mutex.acquire(timeout=self.MUTEX_TIMEOUT)
-            if not acquired:
-                self.get_logger().error(f"Failed to acquire lock for finding remainder order id: {order_id}")
-                return None
-            
-            status = self.mtrl_box_status.get(order_id)
-            proc = self.proc_order.get(order_id)
-            
-            if status is None or proc is None:
-                self.get_logger().error(f"Order ID {order_id} not found in status or process data")
-                raise KeyError(f"Order ID {order_id} not found")
-            
-            # Track existing dispenser stations in current material box
-            curr_mtrl_box = status.material_box
-            curr_gone = self.get_curr_gone(curr_mtrl_box)
-            # Required stations
-            req_mtrl_box = proc.material_box
-            req_to_go = self.get_req_to_go(req_mtrl_box)
-        
-            self.get_logger().warning(f"Order {order_id}: Current stations {sorted(curr_gone)}, Required stations {sorted(req_to_go)}")
-
-            return req_to_go - curr_gone 
-        except TimeoutError:
-            self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
-        except Exception as e:
-            self.get_logger().error(f"Error getting remainder for order_id {order_id}: {str(e)}")
-        finally:
-            if self.mutex.locked():
-                self.mutex.release() 
-
     def find_mini_remainder(self, order_id: int) -> Optional[set]:
         with self.mutex:
             status = self.mtrl_box_status.get(order_id)
@@ -1269,7 +1238,6 @@ class CoreSystem(Node):
             Optional[int]: The associated order ID if found, None if not found
             
         Raises:
-            TypeError: If mtrl_box_id is not an integer
             ValueError: If mtrl_box_id is negative
         """
         if mtrl_box_id < 0:
@@ -1345,53 +1313,6 @@ class CoreSystem(Node):
 
         self.get_logger().info(f"Failed to move out material box [{mtrl_box_id}] in station [{station_id}]")
         return False
-        
-    def dispense_action(self, 
-                        station: DispenserStation, 
-                        station_id: int, 
-                        filtered_missing, 
-                        order: OrderRequest, 
-                        target_cell: int) -> bool:
-        """
-        Process dispensing operations for a specific station across material box cells.
-        
-        Args:
-            station: DispenserStation object tracking completion status
-            station_id: ID of the dispensing station
-            status: MaterialBoxStatus containing current box state
-            order: OrderRequest containing required drugs
-            target_cell: XXXX
-            
-        Returns:
-            bool: True if dispensing completed successfully, False otherwise
-        """
-        if not isinstance(station, DispenserStation) or \
-           not isinstance(order, OrderRequest):
-            self.get_logger().error("Invalid object types provided")
-            return False
-        if not isinstance(station_id, int) or station_id < 0:
-            self.get_logger().error(f"Invalid station_id: {station_id}")
-            return False
-        if not (0 <= target_cell < Const.CELLS):
-            self.get_logger().error(f"Invalid start_cell: {target_cell}")
-            return False
-
-        try:
-            success = self.send_dispense_req(filtered_missing, station_id, target_cell, order.order_id)
-
-            if success:
-                with self.mutex:
-                    station.set_dispense_req_sent(target_cell, True)
-                return True
-            
-            self.get_logger().error(f"Dispense failed for station {station_id}, cell {target_cell}")
-            return False
-        except KeyError:
-            self.get_logger().error(f"No service client for station {station_id}")
-            return False
-        except Exception as e:
-            self.get_logger().error(f"Dispense error for station {station_id}: {str(e)}")
-            return False
     
     def find_target_cell(self, 
                         station: DispenserStation, 
@@ -1420,15 +1341,6 @@ class CoreSystem(Node):
             self.get_logger().error(f"Invalid station_id: {station_id}")
             return None, 0
 
-        def _map_index(index: int) -> int:
-            if index == 0:
-                return index
-            if index == PlcConst.EXIT_STATION:
-                return index
-            if not (1 <= index <= Const.CELLS):
-                raise Exception("map index out of range")
-            return (index // Const.GRID_WIDTH) + (index % Const.GRID_WIDTH) * Const.GRID_HEIGHT 
-        
         try:
             if Const.FORCE_MOVE_OUT:
                 target_cell = PlcConst.EXIT_STATION
@@ -1437,7 +1349,7 @@ class CoreSystem(Node):
                 target_cell = PlcConst.EXIT_STATION
                 with self.mutex:
                     for i in range(0, Const.CELLS):
-                        transfered_index = _map_index(i)
+                        transfered_index = self._map_index(i)
                         if station.is_completed[transfered_index] == False:
                             target_cell = transfered_index
                             break
@@ -1463,6 +1375,7 @@ class CoreSystem(Node):
                 curr: Set[Tuple[int, int, int], ...] = set()
                 for drug in cell_curr_mtrl_box.dispensing_detail:
                     curr.add((drug.location.dispenser_station, drug.location.dispenser_unit, drug.amount))
+
                 if Const.DEBUG_FLAG and bool(required):
                     self.get_logger().warning(f"required: {required}")
                 if Const.DEBUG_FLAG and bool(curr):
@@ -1639,7 +1552,7 @@ class CoreSystem(Node):
             with self.mutex:
                 if status:
                     status.status = MaterialBoxStatus.STATUS_AWAITING_PACKAGING
-            self.get_logger().info(f"updated status to STATUS_AWAITING_PACKAGING w/ box [{material_box_id}]")
+                    self.get_logger().info(f"updated status to STATUS_AWAITING_PACKAGING w/ box [{material_box_id}]")
 
         return is_completed
         
@@ -1729,7 +1642,6 @@ class CoreSystem(Node):
                 self.get_logger().debug(f"Skipped elevator movement for box {material_box_id} (currently releasing box)")
                 return False
 
-        # elif not self.is_elevator_ready:
         if status := self.mtrl_box_status.get(order_id):
             # update location
             with self.mutex:
@@ -1801,9 +1713,7 @@ class CoreSystem(Node):
 
             self.get_logger().info("rel_blocking_cli is called, waiting for future done")
             return True
-        except AttributeError as e:
-            self.get_logger().error(f"Invalid service response: {str(e)}")
-            return False
+
         except Exception as e:
             self.get_logger().error(f"Service call failed: {str(e)}")
             return False
@@ -1841,9 +1751,7 @@ class CoreSystem(Node):
 
             self.get_logger().info("in_mtrl_box_cli is called, waiting for future done")
             return True
-        except AttributeError as e:
-            self.get_logger().error(f"Invalid service response for ID {mtrl_box_id}: {str(e)}")
-            return False
+
         except Exception as e:
             self.get_logger().error(f"Service call failed for ID {mtrl_box_id}: {str(e)}")
             return False
@@ -1922,25 +1830,37 @@ class CoreSystem(Node):
             
             self.get_logger().info("pkg_order_cli is called, waiting for future done")
             return True
-        except AttributeError as e:
-            self.get_logger().error(f"Invalid service response for order id {order_id}: {str(e)}")
-            return False
-        except ValueError as e:
-            return False  
+        
         except Exception as e:
             self.get_logger().error(f"Service call failed for order id {order_id}: {str(e)}")
             return False
        
     def send_dispense_req(self, filtered_missing, station_id: int, cell_no: int, order_id: int) -> Optional[bool]:
+        """
+        Process dispensing operations for a material box cells.
+        
+        Args:
+            filtered_missing: 
+            station_id: ID of the dispensing station
+            cell_no: 
+            order_id:
+            
+        Returns:
+            bool: True if dispensing completed successfully, False otherwise
+        """
         if not all(isinstance(x, (int)) for x in [station_id, cell_no, order_id]):
             self.get_logger().error("Invalid integer types provided")
+            return False
+        if not isinstance(station_id, int) or station_id < 0:
+            self.get_logger().error(f"Invalid station_id: {station_id}")
+            return False
+        if not (0 <= cell_no < Const.CELLS):
+            self.get_logger().error(f"Invalid cell_no: {cell_no}")
             return False
         
         req = DispenseDrug.Request()
 
-        if Const.FAKE_DISPENSE:
-            pass
-        else:
+        if not Const.FAKE_DISPENSE:
             for item in filtered_missing:
                 req.content.append(DispenseContent(unit_id=item[0][1], amount=item[0][2]))
 
@@ -1958,9 +1878,7 @@ class CoreSystem(Node):
 
             self.get_logger().debug(f"dis_station_clis [{station_id}] is called, waiting for future done")
             return True
-        except AttributeError as e:
-            self.get_logger().error(f"Invalid service response {station_id}: {str(e)}")
-            return False
+        
         except Exception as e:
             self.get_logger().error(f"Service call failed {station_id}: {str(e)}")
             return False
@@ -2006,9 +1924,7 @@ class CoreSystem(Node):
                 return res.values
             
             return None
-        except AttributeError as e:
-            self.get_logger().error(f"Invalid response format for address {address}: {str(e)}")
-            return None
+        
         except Exception as e:
             self.get_logger().error(f"Failed to read registers at {address}: {str(e)}")
             return None
@@ -2056,9 +1972,7 @@ class CoreSystem(Node):
                 
             self.get_logger().error(f"Service reported failure writing {len(values)} registers at {address}")
             return False
-        except AttributeError as e:
-            self.get_logger().error(f"Invalid response format for address {address}: {str(e)}")
-            return False
+        
         except Exception as e:
             self.get_logger().error(f"Failed to write registers at {address}: {str(e)}")
             return False
@@ -2283,6 +2197,16 @@ class CoreSystem(Node):
 
         self.get_logger().debug(f"\n{self.conveyor}")
 
+    def _map_index(self, index: int) -> int:
+        if index == 0:
+            return index
+        if index == PlcConst.EXIT_STATION:
+            return index
+        if not (1 <= index <= Const.CELLS):
+            raise Exception("map index out of range")
+        
+        return (index // Const.GRID_WIDTH) + (index % Const.GRID_WIDTH) * Const.GRID_HEIGHT 
+
     def _get_dis_station_cli(self, station_id: int) -> Optional[rclpy.client.Client]:
         """Safely get a dispenser station client by ID."""
         return self.dis_station_clis.get(station_id)
@@ -2305,6 +2229,52 @@ class CoreSystem(Node):
         super().destroy_node()
 
     # deprecated functions
+
+    # def dispense_action(self, 
+    #                     station: DispenserStation, 
+    #                     station_id: int, 
+    #                     filtered_missing, 
+    #                     order: OrderRequest, 
+    #                     target_cell: int) -> bool:
+    #     """
+    #     Process dispensing operations for a specific station across material box cells.
+        
+    #     Args:
+    #         station: DispenserStation object tracking completion status
+    #         station_id: ID of the dispensing station
+    #         status: MaterialBoxStatus containing current box state
+    #         order: OrderRequest containing required drugs
+    #         target_cell: XXXX
+            
+    #     Returns:
+    #         bool: True if dispensing completed successfully, False otherwise
+    #     """
+    #     if not isinstance(station, DispenserStation) or \
+    #        not isinstance(order, OrderRequest):
+    #         self.get_logger().error("Invalid object types provided")
+    #         return False
+    #     if not isinstance(station_id, int) or station_id < 0:
+    #         self.get_logger().error(f"Invalid station_id: {station_id}")
+    #         return False
+    #     if not (0 <= target_cell < Const.CELLS):
+    #         self.get_logger().error(f"Invalid start_cell: {target_cell}")
+    #         return False
+
+    #     try:
+    #         success = self.send_dispense_req(filtered_missing, station_id, target_cell, order.order_id)
+
+    #         if success:
+    #             return True
+            
+    #         self.get_logger().error(f"Dispense failed for station {station_id}, cell {target_cell}")
+    #         return False
+    #     except KeyError:
+    #         self.get_logger().error(f"No service client for station {station_id}")
+    #         return False
+    #     except Exception as e:
+    #         self.get_logger().error(f"Dispense error for station {station_id}: {str(e)}")
+    #         return False
+        
     def movement_decision_v1(self, order_id: int, station_ids: List[int]) -> Optional[int]:
         """
         Determine the next station ID for an order based on requirements and availability.
@@ -2372,3 +2342,35 @@ class CoreSystem(Node):
         #     self.get_logger().error(f"Unexpected error for order {order_id}: {str(e)}")
         #     return Const.GO_STRAIGHT
         
+    def find_remainder(self, order_id: int) -> Optional[set]:
+        return None
+        # try:
+        #     acquired = self.mutex.acquire(timeout=self.MUTEX_TIMEOUT)
+        #     if not acquired:
+        #         self.get_logger().error(f"Failed to acquire lock for finding remainder order id: {order_id}")
+        #         return None
+            
+        #     status = self.mtrl_box_status.get(order_id)
+        #     proc = self.proc_order.get(order_id)
+            
+        #     if status is None or proc is None:
+        #         self.get_logger().error(f"Order ID {order_id} not found in status or process data")
+        #         raise KeyError(f"Order ID {order_id} not found")
+            
+        #     # Track existing dispenser stations in current material box
+        #     curr_mtrl_box = status.material_box
+        #     curr_gone = self.get_curr_gone(curr_mtrl_box)
+        #     # Required stations
+        #     req_mtrl_box = proc.material_box
+        #     req_to_go = self.get_req_to_go(req_mtrl_box)
+        
+        #     self.get_logger().warning(f"Order {order_id}: Current stations {sorted(curr_gone)}, Required stations {sorted(req_to_go)}")
+
+        #     return req_to_go - curr_gone 
+        # except TimeoutError:
+        #     self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
+        # except Exception as e:
+        #     self.get_logger().error(f"Error getting remainder for order_id {order_id}: {str(e)}")
+        # finally:
+        #     if self.mutex.locked():
+        #         self.mutex.release() 
