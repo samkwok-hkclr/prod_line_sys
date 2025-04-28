@@ -312,7 +312,7 @@ class NewOrderActionServer(Node):
                     if sent_tuple and sent_tuple[0]:
                         status_tuple = self.mtrl_box_status.get(order_id)
                         if status_tuple is None:
-                            self.get_logger().error(f"Status for order_id {order_id} does not publish yet")
+                            self.get_logger().debug(f"Status for order_id {order_id} does not publish yet")
                         else:
                             if status_tuple[0].id != 0:
                                 result.response.material_box_id = status_tuple[0].id
