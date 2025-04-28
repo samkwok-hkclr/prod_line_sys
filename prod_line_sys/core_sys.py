@@ -180,7 +180,7 @@ class CoreSystem(Node):
         self.get_logger().info("Service Clients are created")
 
         # Timers
-        self.once_timer = self.create_timer(3.0, self.once_timer_cb, callback_group=normal_timer_cbg)
+        self.once_timer = self.create_timer(2.0, self.once_timer_cb, callback_group=normal_timer_cbg)
         self.qr_handle_timer = self.create_timer(1.0, self.qr_handle_cb, callback_group=qr_handle_timer_cbg)
         self.start_order_timer = self.create_timer(1.0, self.start_order_cb, callback_group=order_timer_cbg)
         self.order_status_timer = self.create_timer(1.0, self.order_status_cb, callback_group=normal_timer_cbg)
@@ -189,7 +189,7 @@ class CoreSystem(Node):
         self.occupancy_status_timer = self.create_timer(1.0, self.occupancy_status_cb, callback_group=occupancy_timer_cbg)
         self.release_cleaning_timer = self.create_timer(1.0, self.release_cleaning_cb, callback_group=normal_timer_cbg)
         self.release_vision_timer = self.create_timer(1.0, self.release_vision_cb, callback_group=normal_timer_cbg)
-        self.clear_conveyor_occupancy_timer = self.create_timer(0.125, self.clear_conveyor_occupancy_cb, callback_group=clear_timer_cbg)
+        self.clear_conveyor_occupancy_timer = self.create_timer(0.1, self.clear_conveyor_occupancy_cb, callback_group=clear_timer_cbg)
         self.dis_station_timers: Dict[int, rclpy.Timer.Timer] = dict()
         for i in range(1, Const.NUM_DISPENSER_STATIONS + 1):
             cbg_index = int(i - 1)
@@ -586,18 +586,20 @@ class CoreSystem(Node):
             with self.occupy_mutex:
                 if conveyor_seg.is_occupied:
                     conveyor_seg.clear()
-                    self.get_logger().error(f"Clear conveyor id: {conveyor_seg.id}")
+                    self.get_logger().error(f"Cleared conveyor id: {conveyor_seg.id}")
     
     def order_status_cb(self) -> None:
         """
         Publish material box status messages.
         """
-        curr_time = self.get_clock().now().to_msg()
-
         with self.mutex:
             for status in self.mtrl_box_status.values():
-                status.header.stamp = curr_time
-                self.mtrl_box_status_pub.publish(status)
+                if status.id <= 0:
+                    status.header.stamp = self.get_clock().now().to_msg()
+                    self.mtrl_box_status_pub.publish(status)
+                    self.get_logger().debug(f"Published status for material box ID {status.id}")
+                else:
+                    self.get_logger().debug(f"Skipped status with invalid ID 0")
 
     def elevator_dequeue_cb(self) -> None:
         # with self.mutex:
@@ -740,44 +742,92 @@ class CoreSystem(Node):
         self.get_logger().debug(f"Jack-up exit status data: {jack_up_exit_status_msg.data}")
     
     def release_cleaning_cb(self) -> None:
+        """
+        Release the cleaning machine block if conditions are met.
+        """
         self.get_logger().debug(f"Started to release the cleaning machine")
 
         with self.mutex:
-            if self.release_cleaning:
-                success = self._execute_movement(PlcConst.RELEASE_CLEANING_ADDR, PlcConst.RELEASE_VALUE)
-                if success:
-                    self.release_cleaning = False
-                    self.get_logger().debug(f"release the cleaning machine")
-                else:
-                    self.get_logger().error(f"write_registers movement failed")
+            if not self.release_cleaning:
+                self.get_logger().debug("Cleaning machine release not required")
+                return
+            
+        success = self._execute_movement(PlcConst.RELEASE_CLEANING_ADDR, PlcConst.RELEASE_VALUE)
+        if success:
+            with self.mutex:
+                self.release_cleaning = False
+            self.get_logger().debug(f"release the cleaning machine")
+        else:
+            self.get_logger().error(f"write_registers movement failed")
 
     def release_vision_cb(self) -> None:
+        """
+        Release the vision inspection block if conditions are met.
+        """
         self.get_logger().debug(f"Started to release the vision inspection")
 
         with self.mutex:
-            if self.release_vision:
-                pkg_1_conveyor = self.conveyor.get_conveyor(Const.CAMERA_ID_PKG_MAC_1)
-                pkg_2_conveyor = self.conveyor.get_conveyor(Const.CAMERA_ID_PKG_MAC_2)
-                if pkg_1_conveyor and pkg_2_conveyor and pkg_1_conveyor.available() and pkg_2_conveyor.available():
-                    success = self._execute_movement(PlcConst.RELEASE_VISION_ADDR, PlcConst.RELEASE_VALUE)
-                    if success:
-                        with self.mutex:
-                            self.release_vision = False
-                        self.get_logger().debug(f"release the vision inspection")
-                    else:
-                        self.get_logger().error(f"write_registers movement failed")
+            if not self.release_vision:
+                self.get_logger().debug("Vision release not required")
+                return
+            
+        pkg_1_conveyor = self.conveyor.get_conveyor(Const.CAMERA_ID_PKG_MAC_1)
+        pkg_2_conveyor = self.conveyor.get_conveyor(Const.CAMERA_ID_PKG_MAC_2)
+
+        if not pkg_1_conveyor or not pkg_2_conveyor:
+            self.get_logger().error("One or both conveyors not found")
+            return
+        
+        if not pkg_1_conveyor.available() or not pkg_2_conveyor.available():
+            self.get_logger().debug("One or both conveyors not available")
+            return
+        
+        success = self._execute_movement(PlcConst.RELEASE_VISION_ADDR, PlcConst.RELEASE_VALUE)
+        if success:
+            with self.mutex:
+                self.release_vision = False
+            self.get_logger().debug(f"Release the vision block")
+        else:
+            self.get_logger().error(f"write_registers movement failed")
 
     def clear_conveyor_occupancy_cb(self) -> None:
-        self.get_logger().debug(f"Started to clear conveyor occupancy")
+        # self.get_logger().debug(f"Started to clear conveyor occupancy")
+
+        # with self.jack_up_mutex:
+        #     for conveyor_id, state in self.jack_up_exit_status.items():
+        #         if state:
+        #             conveyor = self.conveyor.get_conveyor(conveyor_id)
+        #             with self.occupy_mutex:
+        #                 if conveyor and conveyor.is_occupied:
+        #                     conveyor.clear()
+        #                     self.get_logger().error(f"Clear conveyor id: {conveyor_id}")
+        """
+        Clear occupancy of conveyors in the jack-up exit state.
+        """
+        self.get_logger().debug("Started clearing conveyor occupancy")
+        cleared_count = 0
+        conveyors_to_clear = []
 
         with self.jack_up_mutex:
             for conveyor_id, state in self.jack_up_exit_status.items():
                 if state:
                     conveyor = self.conveyor.get_conveyor(conveyor_id)
-                    with self.occupy_mutex:
-                        if conveyor and conveyor.is_occupied:
-                            conveyor.clear()
-                            self.get_logger().error(f"Clear conveyor id: {conveyor_id}")
+                    if not conveyor:
+                        self.get_logger().warning(f"No conveyor found for ID: {conveyor_id}")
+                        continue
+                    if conveyor.is_occupied:
+                        conveyors_to_clear.append((conveyor_id, conveyor))
+
+        with self.occupy_mutex:
+            for conveyor_id, conveyor in conveyors_to_clear:
+                try:
+                    conveyor.clear()
+                    self.get_logger().info(f"Cleared conveyor ID: {conveyor_id}")
+                    cleared_count += 1
+                except Exception as e:
+                    self.get_logger().error(f"Failed to clear conveyor ID {conveyor_id}: {e}")
+
+        self.get_logger().debug(f"Cleared {cleared_count} conveyors")
 
     def _handle_opposite_exit_movement(self, order_id: int, source_station_id: int, mtrl_box_id: int, to_remove: list, jack_up_pt: int) -> None:
         self.get_logger().info(f"handle exit movement!!!")
@@ -1164,16 +1214,6 @@ class CoreSystem(Node):
                 curr_gone.add(station_id)
         return curr_gone
 
-    # FIXME: this function is inaccuracy for validating the requirement
-    def get_req_to_go(self, mtrl_box: MaterialBox) -> set:
-        req_to_go = set()
-        for cell in mtrl_box.slots:
-            for drug in cell.drugs:
-                for location in drug.locations:
-                    station_id = location.dispenser_station
-                    req_to_go.add(station_id)
-        return req_to_go
-
     def find_mini_req_to_go(self, mtrl_box: MaterialBox) -> set:
         if not isinstance(mtrl_box, MaterialBox):
             raise TypeError("mtrl_box must be MaterialBox object")
@@ -1244,13 +1284,17 @@ class CoreSystem(Node):
             raise ValueError(f"Material box ID must be non-negative, got {mtrl_box_id}")
         
         with self.mutex:
-            for order_id, status in self.mtrl_box_status.items():
-                if mtrl_box_id == status.id:
-                    self.get_logger().debug(f"Found order {order_id} for material box {mtrl_box_id}")
-                    return order_id
+            order_id = self.mtrl_box_to_order.get(mtrl_box_id)
+            # for order_id, status in self.mtrl_box_status.items():
+            #     if mtrl_box_id == status.id:
+            #         self.get_logger().debug(f"Found order {order_id} for material box {mtrl_box_id}")
+            #         return order_id
 
-        self.get_logger().debug(f"No order found for material box {mtrl_box_id}")
-        return None
+        if order_id is not None:
+            self.get_logger().debug(f"Found order {order_id} for material box {mtrl_box_id}")
+        else:
+            self.get_logger().debug(f"No order found for material box {mtrl_box_id}")
+        return order_id
 
     def get_any_pkc_mac_is_idle(self) -> bool:
         """
@@ -1309,7 +1353,7 @@ class CoreSystem(Node):
                 return True
             else:
                 conveyor_seg.clear()
-                self.get_logger().error(f">>>>> Conveyor Clear: {conveyor_seg.id} because failed to execute movement")
+                self.get_logger().error(f">>>>> Conveyor Cleared: {conveyor_seg.id} because failed to execute movement")
 
         self.get_logger().info(f"Failed to move out material box [{mtrl_box_id}] in station [{station_id}]")
         return False
@@ -1341,21 +1385,18 @@ class CoreSystem(Node):
             self.get_logger().error(f"Invalid station_id: {station_id}")
             return None, 0
 
-        try:
-            if Const.FORCE_MOVE_OUT:
-                target_cell = PlcConst.EXIT_STATION
-                self.get_logger().warning(f"Debug: force to move out Station [{station_id}]")
-            else:
-                target_cell = PlcConst.EXIT_STATION
-                with self.mutex:
-                    for i in range(0, Const.CELLS):
-                        transfered_index = self._map_index(i)
-                        if station.is_completed[transfered_index] == False:
-                            target_cell = transfered_index
-                            break
-                    # target_cell = station.is_completed.index(False)
-        except ValueError:
-            target_cell = PlcConst.EXIT_STATION
+        target_cell = PlcConst.EXIT_STATION
+
+        if Const.FORCE_MOVE_OUT:
+            self.get_logger().warning(f"Debug: force to move out Station [{station_id}]")
+        else:
+            with self.mutex:
+                for i in range(0, Const.CELLS):
+                    transfered_index = self._map_index(i)
+                    if not station.is_completed[transfered_index]:
+                        target_cell = transfered_index
+                        self.get_logger().debug(f"Selected target cell: {target_cell}")
+                        break
         
         filtered_missing = []
         
@@ -1572,9 +1613,6 @@ class CoreSystem(Node):
         is_completed = False
         pkg_req_success = False
 
-        # FIXME: No need to find reminder if vision inspection is done
-        # remainder = self.find_remainder(order_id)
-
         status = self.mtrl_box_status.get(order_id)
         ready_to_pkg = False
         with self.mutex:
@@ -1605,7 +1643,7 @@ class CoreSystem(Node):
         with self.occupy_mutex:
             if conveyor and conveyor.is_occupied:
                 conveyor.clear()
-                self.get_logger().error(f"Clear conveyor id: {Const.CAMERA_ID_VISION}")
+                self.get_logger().error(f"Cleared conveyor id: {Const.CAMERA_ID_VISION}")
         
         pkg_conveyor = self.conveyor.get_conveyor(Const.CAMERA_ID_PKG_MAC_1)
         with self.occupy_mutex:
@@ -1652,9 +1690,6 @@ class CoreSystem(Node):
                     elevator_success = self._execute_movement(PlcConst.TRANSFER_MTRL_BOX_ADDR, PlcConst.MTRL_BOX_RETRIEVAL_PLC_VALUES)
                     if elevator_success:
                         if popped_status := self.mtrl_box_status.pop(order_id):
-                            popped_status.status = MaterialBoxStatus.STATUS_IN_STORAGE
-                            self.mtrl_box_status_pub.publish(popped_status)
-                            self.get_logger().warning(f"Published the last status")
                             is_completed = True
                         self.get_logger().warning(f"Sent elevator request (retrieval) successfully")
                     else:
@@ -1687,7 +1722,7 @@ class CoreSystem(Node):
         with self.occupy_mutex:
             if pkg_1_conveyor and pkg_1_conveyor.is_occupied:
                 pkg_1_conveyor.clear()
-                self.get_logger().error(f"Clear conveyor id: {Const.CAMERA_ID_PKG_MAC_1}")
+                self.get_logger().error(f"Cleared conveyor id: {Const.CAMERA_ID_PKG_MAC_1}")
         
         pkg_2_conveyor = self.conveyor.get_conveyor(Const.CAMERA_ID_PKG_MAC_2)
         with self.occupy_mutex:
@@ -2023,7 +2058,7 @@ class CoreSystem(Node):
             with self.occupy_mutex:
                 if pkg_2_conveyor and pkg_2_conveyor.is_occupied:
                     pkg_2_conveyor.clear()
-                    self.get_logger().error(f"Clear conveyor id: {Const.CAMERA_ID_PKG_MAC_2}")
+                    self.get_logger().error(f"Cleared conveyor id: {Const.CAMERA_ID_PKG_MAC_2}")
 
             self.get_logger().info(f"Released the block successfully")
         else:
@@ -2184,7 +2219,7 @@ class CoreSystem(Node):
         self.conveyor.append(4)
         self.conveyor.attach_station(4, "left", DispenserStation(7))
         self.conveyor.append(5)
-        self.conveyor.attach_station(5, "left", DispenserStation(8)) # Is station 8 left hand-side?
+        self.conveyor.attach_station(5, "left", DispenserStation(8))
         self.conveyor.append(6)
         self.conveyor.attach_station(6, "left", DispenserStation(10))
         self.conveyor.attach_station(6, "right", DispenserStation(9))
@@ -2231,7 +2266,7 @@ class CoreSystem(Node):
 
         super().destroy_node()
 
-    # deprecated functions
+    # ================= deprecated functions =================
 
     # def dispense_action(self, 
     #                     station: DispenserStation, 
@@ -2377,3 +2412,13 @@ class CoreSystem(Node):
         # finally:
         #     if self.mutex.locked():
         #         self.mutex.release() 
+
+    # FIXME: this function is inaccuracy for validating the requirement
+    def get_req_to_go(self, mtrl_box: MaterialBox) -> set:
+        req_to_go = set()
+        for cell in mtrl_box.slots:
+            for drug in cell.drugs:
+                for location in drug.locations:
+                    station_id = location.dispenser_station
+                    req_to_go.add(station_id)
+        return req_to_go
