@@ -90,6 +90,12 @@ class CoreSystem(Node):
         self.num_of_mtrl_box_in_container = 0
         self.pkg_mac_status: Dict[int, PackagingMachineStatus] = {} # pkg_mac_id, PackagingMachineStatus
 
+        # Status of PLC registers
+        self.is_plc_connected: bool = False
+        self.is_releasing_mtrl_box: bool = False
+        self.is_elevator_ready: bool = False
+        self.is_vision_block_released: bool = False
+
         # ROS2 client node, maybe unused
         # self.test_cli_node = rclpy.create_node("test_cli_node")
         # self.exec.add_node(self.test_cli_node)
@@ -114,12 +120,6 @@ class CoreSystem(Node):
 
         # sync delay, try to avoid to use it
         # self.waiting_result = self.create_rate(1.0, self.get_clock())
-
-        # Status of PLC registers
-        self.is_plc_connected: bool = False
-        self.is_releasing_mtrl_box: bool = False
-        self.is_elevator_ready: bool = False
-        self.is_vision_block_released: bool = False
 
         # Callback groups
         sub_cbg = MutuallyExclusiveCallbackGroup()
@@ -184,7 +184,7 @@ class CoreSystem(Node):
         self.get_logger().info("Service Clients are created")
 
         # Timers
-        self.once_timer = self.create_timer(2.0, self.once_timer_cb, callback_group=normal_timer_cbg)
+        self.once_timer = self.create_timer(3.0, self.once_timer_cb, callback_group=normal_timer_cbg)
         self.qr_handle_timer = self.create_timer(1.0, self.qr_handle_cb, callback_group=qr_handle_timer_cbg)
         self.start_order_timer = self.create_timer(1.0, self.start_order_cb, callback_group=order_timer_cbg)
         self.order_status_timer = self.create_timer(1.0, self.order_status_cb, callback_group=normal_timer_cbg)
@@ -2240,14 +2240,13 @@ class CoreSystem(Node):
         self.get_logger().debug(f"\n{self.conveyor}")
 
     def _map_index(self, index: int) -> int:
-        if index == 0:
-            return index
         if index == self.plc_const.EXIT_STATION:
             return index
-        if not (1 <= index <= self.const.CELLS):
+        if not (0 <= index < self.const.CELLS):
             raise Exception("map index out of range")
         
-        return (index // self.const.GRID_WIDTH) + (index % self.const.GRID_WIDTH) * self.const.GRID_HEIGHT 
+        return self.const.INDEX_MAP.get(index)
+        # return (index // self.const.GRID_WIDTH) + (index % self.const.GRID_WIDTH) * self.const.GRID_HEIGHT 
 
     def _get_dis_station_cli(self, station_id: int) -> Optional[rclpy.client.Client]:
         """Safely get a dispenser station client by ID."""
@@ -2270,159 +2269,13 @@ class CoreSystem(Node):
 
         super().destroy_node()
 
-    # ================= deprecated functions =================
-
-    # def dispense_action(self, 
-    #                     station: DispenserStation, 
-    #                     station_id: int, 
-    #                     filtered_missing, 
-    #                     order: OrderRequest, 
-    #                     target_cell: int) -> bool:
-    #     """
-    #     Process dispensing operations for a specific station across material box cells.
-        
-    #     Args:
-    #         station: DispenserStation object tracking completion status
-    #         station_id: ID of the dispensing station
-    #         status: MaterialBoxStatus containing current box state
-    #         order: OrderRequest containing required drugs
-    #         target_cell: XXXX
-            
-    #     Returns:
-    #         bool: True if dispensing completed successfully, False otherwise
-    #     """
-    #     if not isinstance(station, DispenserStation) or \
-    #        not isinstance(order, OrderRequest):
-    #         self.get_logger().error("Invalid object types provided")
-    #         return False
-    #     if not isinstance(station_id, int) or station_id < 0:
-    #         self.get_logger().error(f"Invalid station_id: {station_id}")
-    #         return False
-    #     if not (0 <= target_cell < Const.CELLS):
-    #         self.get_logger().error(f"Invalid start_cell: {target_cell}")
-    #         return False
-
-    #     try:
-    #         success = self.send_dispense_req(filtered_missing, station_id, target_cell, order.order_id)
-
-    #         if success:
-    #             return True
-            
-    #         self.get_logger().error(f"Dispense failed for station {station_id}, cell {target_cell}")
-    #         return False
-    #     except KeyError:
-    #         self.get_logger().error(f"No service client for station {station_id}")
-    #         return False
-    #     except Exception as e:
-    #         self.get_logger().error(f"Dispense error for station {station_id}: {str(e)}")
-    #         return False
+    # ================= caution!!! deprecated functions =================
         
     def movement_decision_v1(self, order_id: int, station_ids: List[int]) -> Optional[int]:
-        """
-        Determine the next station ID for an order based on requirements and availability.
-        
-        Args:
-            order_id: The order to process
-            station_ids: List of available dispenser station IDs
-            
-        Returns:
-            Optional[int]: Selected station ID if successful, None if no suitable station found
-            
-        Raises:
-            TypeError: If inputs are of incorrect type
-            ValueError: If order_id is negative or station_ids is empty
-        """
         return self.const.GO_STRAIGHT
-        # if not isinstance(order_id, int):
-        #     raise TypeError(f"Expected integer order_id, got {type(order_id).__name__}")
-        # if not isinstance(station_ids, list) or not all(isinstance(x, int) for x in station_ids):
-        #     raise TypeError(f"Expected list of integers for station_ids, got {type(station_ids).__name__}")
-        # if order_id < 0:
-        #     raise ValueError(f"Order ID must be non-negative, got {order_id}")
-        # if not station_ids:
-        #     raise ValueError("Dispenser station ID list cannot be empty")
-        
-        # try:
-        #     remainder = self.find_remainder(order_id)
-
-        #     if remainder is None or not bool(remainder):
-        #         self.get_logger().error(f"Empty remainder!")
-        #         return Const.GO_STRAIGHT
-
-        #     try:
-        #         acquired = self.mutex.acquire(timeout=self.MUTEX_TIMEOUT)
-        #         if not acquired:
-        #             self.get_logger().error(f"Failed to acquire lock to movement decision v1")
-        #             return Const.GO_STRAIGHT
-
-        #         for station_id in station_ids:
-        #             station = self.conveyor.get_station(station_id)
-        #             if station and station.available() and station_id in remainder:
-        #                 self.get_logger().info(f"Selected station {station_id} for order {order_id}")
-        #                 return station_id
-    
-        #     except TimeoutError:
-        #         self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
-        #         return Const.GO_STRAIGHT
-        #     except Exception as e:
-        #         self.get_logger().error(f"Error: {str(e)}")
-        #         return Const.GO_STRAIGHT
-        #     finally:
-        #         if self.mutex.locked():
-        #             self.mutex.release()
-                
-        #     self.get_logger().info(f"No suitable station found for order {order_id} from {station_ids}")
-        #     return Const.GO_STRAIGHT
-
-        # except AttributeError as e:
-        #     self.get_logger().error(f"Invalid data structure for order {order_id}: {str(e)}")
-        #     return Const.GO_STRAIGHT
-        # except ValueError as e:
-        #     self.get_logger().error(f"Set operation error for order {order_id}: {str(e)}")
-        #     return Const.GO_STRAIGHT
-        # except Exception as e:
-        #     self.get_logger().error(f"Unexpected error for order {order_id}: {str(e)}")
-        #     return Const.GO_STRAIGHT
         
     def find_remainder(self, order_id: int) -> Optional[set]:
         return None
-        # try:
-        #     acquired = self.mutex.acquire(timeout=self.MUTEX_TIMEOUT)
-        #     if not acquired:
-        #         self.get_logger().error(f"Failed to acquire lock for finding remainder order id: {order_id}")
-        #         return None
-            
-        #     status = self.mtrl_box_status.get(order_id)
-        #     proc = self.proc_order.get(order_id)
-            
-        #     if status is None or proc is None:
-        #         self.get_logger().error(f"Order ID {order_id} not found in status or process data")
-        #         raise KeyError(f"Order ID {order_id} not found")
-            
-        #     # Track existing dispenser stations in current material box
-        #     curr_mtrl_box = status.material_box
-        #     curr_gone = self.get_curr_gone(curr_mtrl_box)
-        #     # Required stations
-        #     req_mtrl_box = proc.material_box
-        #     req_to_go = self.get_req_to_go(req_mtrl_box)
-        
-        #     self.get_logger().warning(f"Order {order_id}: Current stations {sorted(curr_gone)}, Required stations {sorted(req_to_go)}")
 
-        #     return req_to_go - curr_gone 
-        # except TimeoutError:
-        #     self.get_logger().error(f"Failed to acquire mutex within {self.MUTEX_TIMEOUT} seconds")
-        # except Exception as e:
-        #     self.get_logger().error(f"Error getting remainder for order_id {order_id}: {str(e)}")
-        # finally:
-        #     if self.mutex.locked():
-        #         self.mutex.release() 
-
-    # FIXME: this function is inaccuracy for validating the requirement
-    def get_req_to_go(self, mtrl_box: MaterialBox) -> set:
-        req_to_go = set()
-        for cell in mtrl_box.slots:
-            for drug in cell.drugs:
-                for location in drug.locations:
-                    station_id = location.dispenser_station
-                    req_to_go.add(station_id)
-        return req_to_go
+    def get_req_to_go(self, mtrl_box: MaterialBox) -> Optional[set]:
+        return None
