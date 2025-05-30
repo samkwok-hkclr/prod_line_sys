@@ -27,7 +27,7 @@ def main(args=None):
     fake_new_order = FakeNewOrder()
     req = OrderRequest()
     req.patient.name = "Sam Kwok"
-    req.patient.institute_name = "HKCLR"
+    req.patient.name_cn = "HKCLR"
 
     req.start_date = "2024-01-01"
     req.start_meal = 0

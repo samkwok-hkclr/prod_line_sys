@@ -185,7 +185,7 @@ class NewOrderActionServer(Node):
             if not proc_order.material_box.slots[i].drugs:
                 continue
 
-            info.cn_name = proc_order.patient.institute_name
+            info.cn_name = proc_order.patient.name_cn
             info.en_name  = proc_order.patient.name
 
             curr_meal = (proc_order.start_meal + i) % 4
@@ -204,7 +204,7 @@ class NewOrderActionServer(Node):
                 info.date = "ERROR"
                 self.get_logger().error(f"Invalid date format for order {order_id}: {str(e)}")
 
-            info.qr_code = PkgInfo.QR_CODE
+            info.qr_code = proc_order.prescription_id + ":" + str(i)
 
             for drug in proc_order.material_box.slots[i].drugs:
                 drug_str = f"{drug.name}   {drug.amount}"
