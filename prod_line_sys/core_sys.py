@@ -1835,7 +1835,7 @@ class CoreSystem(Node):
             if not proc_order.material_box.slots[i].drugs:
                 continue
 
-            info.cn_name = proc_order.patient.name_cn
+            info.cn_name = proc_order.patient.name_ch
             info.en_name  = proc_order.patient.name
 
             curr_meal = (proc_order.start_meal + i) % 4
