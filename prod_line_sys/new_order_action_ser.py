@@ -38,7 +38,8 @@ class NewOrderActionServer(Node):
 
         # Callback groups
         sub_cbg = MutuallyExclusiveCallbackGroup()
-        srv_cli_cbg = MutuallyExclusiveCallbackGroup()
+        new_order_srv_cli_cbg = MutuallyExclusiveCallbackGroup()
+        pkg_order_srv_cli_cbg = MutuallyExclusiveCallbackGroup()
         srv_ser_cbg = MutuallyExclusiveCallbackGroup()
         action_ser_cbg = ReentrantCallbackGroup()
 
@@ -54,8 +55,8 @@ class NewOrderActionServer(Node):
         )
 
         # Service clients
-        self.new_order_cli = self.create_client(NewOrder, "new_order", callback_group=srv_cli_cbg)
-        self.pkg_order_cli = self.create_client(PackagingOrder, "packaging_order", callback_group=srv_cli_cbg)
+        self.new_order_cli = self.create_client(NewOrder, "new_order", callback_group=new_order_srv_cli_cbg)
+        self.pkg_order_cli = self.create_client(PackagingOrder, "packaging_order", callback_group=pkg_order_srv_cli_cbg)
 
         self.sim_pkg_order_srv_ser = self.create_service(SimplifiedPackagingOrder, "simplified_packaging_order", self.pkg_pkg_cb, callback_group=srv_ser_cbg)
 
@@ -204,7 +205,8 @@ class NewOrderActionServer(Node):
                 info.date = "ERROR"
                 self.get_logger().error(f"Invalid date format for order {order_id}: {str(e)}")
 
-            info.qr_code = proc_order.prescription_id + ":" + str(i)
+            # info.qr_code = proc_order.prescription_id + ":" + str(i)
+            info.qr_code = "https://www.hkclr.hk"
 
             for drug in proc_order.material_box.slots[i].drugs:
                 drug_str = f"{drug.name}   {drug.amount}"
@@ -318,10 +320,11 @@ class NewOrderActionServer(Node):
                                 result.response.material_box_id = status_tuple[0].id
                                 result.response.success = True
                                 break
-
-                self.get_logger().warning(f"Waiting for material box ID for order_id={order_id} ({retries} retries)...")
+                            
                 goal_handle.publish_feedback(feedback_msg)
+                self.get_logger().warning(f"Waiting for material box ID for order_id={order_id} ({retries} retries)...")
                 retries += 1
+
                 self.waiting_result.sleep()
 
             if retries >= MAX_RETRY:
